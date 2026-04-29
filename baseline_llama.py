@@ -44,7 +44,7 @@ CONFIG = {
     "max_steps": 2500,
     "per_device_batch_size": 12,
     "grad_accum_steps": 8,
-    "max_seq_len": 4096,
+    "max_seq_len": 2048,
     # --- Data ---
     "dataset_name": "HuggingFaceFW/fineweb",
     "dataset_config": "sample-10BT",

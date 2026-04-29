@@ -1,24 +1,20 @@
 """
 LEC Pretraining - LLaMA + PLE + Router via HuggingFace Trainer
 ==============================================================
-Trains a LLaMA-style model with Lightweight Expert Conditioning from scratch.
 
-Architecture (Phase 1 — PLE + Router only):
-  - Per-layer routing: at each transformer layer, that layer's router runs on
-    the current hidden state and selects top-1 expert for that layer independently.
-  - PLE table: [K, L, d_ple] — per-expert, per-layer embedding vectors.
-  - Shared projection W_ple: d_ple → hidden_size.
-  - All weights (base model + router + PLE) train jointly from scratch.
-  - Auxiliary-loss-free load balancing via per-layer EMA bias (DeepSeek-V3 style).
-  - Orthogonal full-dimensional PLE vector init for expert symmetry breaking.
+Hook-based implementation: preserves the official HuggingFace LlamaForCausalLM
+forward path, RoPE handling, causal mask construction, attention implementation,
+MLP implementation, and built-in causal-LM loss.
 
-Install:
-    pip install torch transformers datasets accelerate wandb
-    pip install flash-attn --no-build-isolation
+LEC injection is done with forward pre-hooks on each decoder layer:
+    hidden_states <- hidden_states + PLE(router_l(hidden_states), layer=l)
 
-Run:
-    python initial_lec_llama.py
+No custom layer loop. No manual attention implementation. No custom LR scheduler.
 """
+
+# =============================================================================
+# CONFIG
+# =============================================================================
 
 CONFIG = {
     # Model
@@ -35,32 +31,26 @@ CONFIG = {
     "tie_word_embeddings": True,
     "attention_bias": False,
     "hidden_act": "silu",
-    # Runtime note: use "sdpa" for this custom layer-by-layer forward.
-    # Some recent transformers+flash-attn combinations expose query tensors in
-    # a layout that does not match the default RoPE broadcast path when decoder
-    # layers are called manually. Switch back to "flash_attention_2" only after
-    # a smoke test passes in your exact environment.
-    "attn_implementation": "eager",
+    "attn_implementation": "flash_attention_2",
     "tokenizer_name": "meta-llama/Llama-3.2-1B",
     # LEC (Phase 1: PLE + Router only)
     "num_experts": 8,
     "ple_dim": 512,
     "lb_ema_alpha": 0.1,
     "lb_bias_lr": 1e-3,
-    "lec_lr_multiplier": 3.0,
-    "lec_warmdown_steps": 10000,
     "entropy_collapse_threshold": 0.5,
+    "lec_metric_log_every_steps": 10,
     # Training
     "learning_rate": 3e-4,
-    "min_lr_ratio": 0.1,
+    "min_lr_ratio": 0.1,  # retained in config for bookkeeping; HF cosine ignores this
     "weight_decay": 0.1,
     "beta1": 0.9,
     "beta2": 0.95,
     "grad_clip": 1.0,
     "warmup_steps": 250,
     "max_steps": 2500,
-    "per_device_batch_size": 4,
-    "grad_accum_steps": 4,
+    "per_device_batch_size": 12,
+    "grad_accum_steps": 8,
     "max_seq_len": 2048,
     # Data
     "dataset_name": "HuggingFaceFW/fineweb",
@@ -80,18 +70,19 @@ CONFIG = {
     "dataloader_prefetch_factor": 2,
     "torch_compile": False,
     "torch_compile_mode": "default",
-    "lec_metric_log_every_steps": 10,
 }
-import math
-import os
-from typing import Optional
 
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+# =============================================================================
+# IMPORTS
+# =============================================================================
+
+import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import IterableDataset
 from transformers import (
     AutoTokenizer,
     LlamaConfig,
@@ -100,15 +91,6 @@ from transformers import (
     TrainingArguments,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-try:
-    import torch._dynamo as _torch_dynamo
-
-    _torch_dynamo.config.suppress_errors = True
-    _dynamo_disable = _torch_dynamo.disable
-except Exception:
-    _dynamo_disable = lambda fn: fn
-
 
 # =============================================================================
 # PLE TABLE
@@ -120,10 +102,9 @@ class PLETable(nn.Module):
     Per-Layer Expert Embedding table: [K, L, d_ple].
 
     Each expert k has one d_ple-dimensional vector per layer l.
-    A single shared projection maps d_ple → hidden_size.
-    Vectors are initialized as full-dimensional, mutually orthogonal
-    expert directions for symmetry breaking — this preserves full-space
-    headroom while making expert choices distinct from step 1.
+    A single shared projection maps d_ple -> hidden_size.
+    Vectors are initialized as full-dimensional, mutually orthogonal expert
+    directions for symmetry breaking.
     """
 
     def __init__(
@@ -132,9 +113,6 @@ class PLETable(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.num_layers = num_layers
-        # Trainer toggles this true only on LEC-metric logging steps.
-        # Loss is still computed every step; expensive/no-grad diagnostics are not.
-        self.log_lec_metrics = False
         self.ple_dim = ple_dim
         self.hidden_size = hidden_size
 
@@ -143,15 +121,8 @@ class PLETable(nn.Module):
         self._init_orthogonal()
 
     def _init_orthogonal(self):
-        """
-        Initialize each layer's expert PLE vectors as full-dimensional,
-        mutually orthogonal directions.
-
-        This is symmetry breaking, not a subspace constraint: every expert is
-        free to learn anywhere in the full d_ple space after initialization.
-        """
         with torch.no_grad():
-            for l in range(self.num_layers):
+            for layer_idx in range(self.num_layers):
                 if self.num_experts <= self.ple_dim:
                     q, _ = torch.linalg.qr(
                         torch.randn(
@@ -161,53 +132,23 @@ class PLETable(nn.Module):
                             dtype=self.embeddings.dtype,
                         )
                     )
-                    # q has orthonormal columns; transpose the first K columns
-                    # to obtain K full-dimensional expert vectors.
-                    self.embeddings[:, l, :] = q[:, : self.num_experts].T * 0.02
+                    self.embeddings[:, layer_idx, :] = q[:, : self.num_experts].T * 0.02
                 else:
-                    nn.init.normal_(self.embeddings[:, l, :], std=0.02)
+                    nn.init.normal_(self.embeddings[:, layer_idx, :], std=0.02)
 
     def get_all_projected(self, layer_idx: int) -> torch.Tensor:
-        """
-        Project every expert's PLE vector for one layer.
+        return self.proj(self.embeddings[:, layer_idx, :])  # [K, H]
 
-        Returns:
-            Tensor [num_experts, hidden_size]. Used by straight-through top-1
-            routing so the forward pass is hard top-1 but gradients flow to
-            router probabilities.
-        """
-        return self.proj(self.embeddings[:, layer_idx, :])
-
-    def get(self, layer_idx: int, expert_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Retrieve and project PLE vectors for a batch of expert assignments.
-
-        Args:
-            layer_idx:  which transformer layer we're at
-            expert_ids: LongTensor [batch, seq_len] of expert indices (0..K-1)
-
-        Returns:
-            Tensor [batch, seq_len, hidden_size] — the PLE shift to add to h
-        """
-        vecs = self.embeddings[:, layer_idx, :]  # [K, d_ple]
-        flat = vecs[expert_ids.reshape(-1)]  # [B*T, d_ple]
-        return self.proj(flat).reshape(*expert_ids.shape, self.hidden_size)
-
+    @torch.no_grad()
     def pairwise_cosine(self) -> float:
-        """
-        Mean pairwise cosine similarity across all experts and all layers.
-        Decreasing = experts are diverging. Checked across all layers, not just 0.
-        """
-        with torch.no_grad():
-            # average over layers for a more representative signal
-            total = 0.0
-            for l in range(self.num_layers):
-                vecs = self.proj(self.embeddings[:, l, :]).float()
-                norms = F.normalize(vecs, dim=-1)
-                sim = norms @ norms.T
-                mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=sim.device)
-                total += sim[mask].mean().item()
-            return total / self.num_layers
+        total = 0.0
+        for layer_idx in range(self.num_layers):
+            vecs = self.proj(self.embeddings[:, layer_idx, :]).detach().float()
+            norms = F.normalize(vecs, dim=-1)
+            sim = norms @ norms.T
+            mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=sim.device)
+            total += sim[mask].mean().item()
+        return total / self.num_layers
 
 
 # =============================================================================
@@ -216,21 +157,7 @@ class PLETable(nn.Module):
 
 
 class LECRouter(nn.Module):
-    """
-    One transformer layer's linear router with gradient-free EMA load-balancing bias.
-
-    Input:  hidden state h at the current layer [batch, seq_len, hidden_size]
-    Output: top-1 expert ids [batch, seq_len], router logits for entropy logging
-
-    LlamaLEC owns one LECRouter per transformer layer. Load balancing follows
-    DeepSeek-V3: a per-expert bias is adjusted
-    gradient-free based on EMA of expert utilization, avoiding auxiliary losses
-    that can dominate the weak specialization gradient signal.
-
-    IMPORTANT: update_load_balance() must be called once per optimizer step,
-    not per micro-step, to avoid effective lb_bias_lr being multiplied by
-    grad_accum_steps.
-    """
+    """One decoder layer's linear router with EMA load-balancing bias."""
 
     def __init__(
         self,
@@ -249,29 +176,13 @@ class LECRouter(nn.Module):
 
         self.register_buffer("lb_bias", torch.zeros(num_experts))
         self.register_buffer("expert_ema_load", torch.ones(num_experts) / num_experts)
-
-        # accumulator for load-balance updates across micro-steps
-        # flushed once per optimizer step in LECTrainer
         self._load_accum: Optional[torch.Tensor] = None
         self._accum_count: int = 0
 
     def forward(self, h: torch.Tensor):
         """
         Straight-through top-1 routing.
-
-        Forward semantics are hard top-1: each token selects exactly one expert.
-        Backward semantics use softmax probabilities, so the router receives
-        task-loss gradient even though dispatch is discrete in the forward pass.
-
-        Args:
-            h: [batch, seq_len, hidden_size]
-
-        Returns:
-            expert_ids:    LongTensor [batch, seq_len]
-            gate:          Tensor [batch, seq_len, K], hard in forward / soft in backward
-            logits:        Tensor [batch, seq_len, K], pre-bias router logits
-            biased_logits: Tensor [batch, seq_len, K], logits used for routing
-            probs:         Tensor [batch, seq_len, K], softmax over biased_logits
+        Forward is hard top-1; backward uses softmax gradient.
         """
         logits = self.linear(h)  # [B, T, K]
         biased_logits = logits + self.lb_bias.to(logits.dtype)  # [B, T, K]
@@ -279,34 +190,26 @@ class LECRouter(nn.Module):
 
         expert_ids = probs.argmax(dim=-1)  # [B, T]
         hard = F.one_hot(expert_ids, num_classes=self.num_experts).to(h.dtype)
-
-        # Straight-through estimator: numerically hard in forward, soft in backward.
         gate = hard + probs - probs.detach()
         return expert_ids, gate, logits, biased_logits, probs
 
     def accumulate_load(self, expert_ids: torch.Tensor):
-        """
-        Accumulate per-expert token counts across micro-steps.
-        Call this on every forward pass during training; flush once per
-        optimizer step in LECTrainer.
-        """
-        flat = expert_ids.detach().reshape(-1)
-        counts = torch.bincount(flat, minlength=self.num_experts).float()
-        load = counts / counts.sum().clamp_min(1.0)
-        load = load.to(self.lb_bias.device)
+        """Accumulate hard expert loads across micro-steps."""
+        with torch.no_grad():
+            flat = expert_ids.detach().reshape(-1)
+            counts = torch.bincount(flat, minlength=self.num_experts).float()
+            load = counts / counts.sum().clamp_min(1.0)
+            load = load.to(self.lb_bias.device)
 
-        if self._load_accum is None:
-            self._load_accum = load
-        else:
-            self._load_accum += load
-        self._accum_count += 1
+            if self._load_accum is None:
+                self._load_accum = load
+            else:
+                self._load_accum += load
+            self._accum_count += 1
 
     @torch.no_grad()
     def flush_load_balance(self):
-        """
-        Update EMA and lb_bias using the accumulated load across micro-steps.
-        Call exactly ONCE per optimizer step (not per micro-step).
-        """
+        """Apply one EMA/bias load-balancing update and clear accumulators."""
         if self._load_accum is None or self._accum_count == 0:
             return
         avg_load = (self._load_accum / self._accum_count).to(self.lb_bias.device)
@@ -319,89 +222,74 @@ class LECRouter(nn.Module):
         self._load_accum = None
         self._accum_count = 0
 
+    @torch.no_grad()
     def soft_entropy_norm(self, biased_logits: torch.Tensor) -> float:
-        """
-        Normalized entropy of the actual biased router distribution.
-        1.0 = uniform soft distribution; 0.0 = fully confident.
-        """
-        with torch.no_grad():
-            p = F.softmax(biased_logits.float(), dim=-1)
-            entropy = -(p * torch.log(p + 1e-10)).sum(dim=-1).mean().item()
-            return entropy / math.log(self.num_experts)
+        p = F.softmax(biased_logits.detach().float(), dim=-1)
+        entropy = -(p * torch.log(p + 1e-10)).sum(dim=-1).mean().item()
+        return entropy / math.log(self.num_experts)
 
     @staticmethod
+    @torch.no_grad()
     def hard_load_entropy_norm(expert_ids: torch.Tensor, num_experts: int) -> float:
-        """
-        Normalized entropy of the realized hard expert assignment histogram.
-        1.0 = evenly used experts; 0.0 = all tokens routed to one expert.
-        """
-        with torch.no_grad():
-            flat = expert_ids.reshape(-1)
-            counts = torch.bincount(flat, minlength=num_experts).float()
-            load = counts / counts.sum().clamp_min(1.0)
-            entropy = -(load * torch.log(load + 1e-10)).sum().item()
-            return entropy / math.log(num_experts)
+        flat = expert_ids.detach().reshape(-1)
+        counts = torch.bincount(flat, minlength=num_experts).float()
+        load = counts / counts.sum().clamp_min(1.0)
+        entropy = -(load * torch.log(load + 1e-10)).sum().item()
+        return entropy / math.log(num_experts)
 
     @staticmethod
+    @torch.no_grad()
     def batch_load(expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
-        with torch.no_grad():
-            flat = expert_ids.reshape(-1)
-            counts = torch.bincount(flat, minlength=num_experts).float()
-            return counts / counts.sum().clamp_min(1.0)
+        flat = expert_ids.detach().reshape(-1)
+        counts = torch.bincount(flat, minlength=num_experts).float()
+        return counts / counts.sum().clamp_min(1.0)
 
 
 # =============================================================================
-# LLAMA + LEC  (per-layer routing via custom forward loop)
+# HOOKED LLAMA + LEC
 # =============================================================================
 
 
 class LlamaLEC(LlamaForCausalLM):
     """
-    LLaMA with per-layer PLE conditioning.
+    LLaMA + LEC using forward pre-hooks on the official HF decoder layers.
 
-    At each transformer layer l:
-        expert_ids_l = router_l(h_l)        # top-1, from current hidden state
-        ple_shift    = PLE.get(l, expert_ids_l)
-        h_l          = h_l + ple_shift
-        h_l+1        = transformer_layer_l(h_l)
-
-    Routing is independent at every layer — the expert chosen at layer 3
-    need not match the expert chosen at layer 7. Each layer has its own router
-    parameters and its own load-balancing EMA/bias state, matching the usual
-    Transformer-MoE pattern more closely than a single shared router.
-
-    All weights (base + per-layer routers + PLE) train jointly from scratch.
+    We do not reimplement LLaMA forward, RoPE, attention, masks, or MLP.
+    HuggingFace handles all internals. Each decoder layer receives a PLE shift
+    immediately before its official forward is called.
     """
 
     def __init__(self, config: LlamaConfig, lec_config: dict):
         super().__init__(config)
         self.lec_config = lec_config
-        num_experts = lec_config["num_experts"]
-        num_layers = config.num_hidden_layers
+        self.num_experts = lec_config["num_experts"]
+        self.num_layers = config.num_hidden_layers
         hidden_size = config.hidden_size
-        self.num_experts = num_experts
-        self.num_layers = num_layers
-        # Trainer toggles this true only on LEC-metric logging steps.
-        # Loss is still computed every step; expensive/no-grad diagnostics are not.
-        self.log_lec_metrics = False
 
         self.routers = nn.ModuleList(
             [
                 LECRouter(
-                    hidden_size,
-                    num_experts,
-                    lec_config["lb_ema_alpha"],
-                    lec_config["lb_bias_lr"],
+                    hidden_size=hidden_size,
+                    num_experts=self.num_experts,
+                    lb_ema_alpha=lec_config["lb_ema_alpha"],
+                    lb_bias_lr=lec_config["lb_bias_lr"],
                 )
-                for _ in range(num_layers)
+                for _ in range(self.num_layers)
             ]
         )
-        self.ple = PLETable(num_experts, num_layers, lec_config["ple_dim"], hidden_size)
+        self.ple = PLETable(
+            self.num_experts, self.num_layers, lec_config["ple_dim"], hidden_size
+        )
+
+        self.log_lec_metrics = False
+        self._metric_layer_records = []
+        self._hook_handles = []
+        self._install_lec_hooks()
 
         base = sum(
             p.numel()
             for n, p in self.named_parameters()
-            if "router" not in n and "ple" not in n
+            if "routers" not in n and "ple" not in n
         )
         lec = sum(p.numel() for p in self.routers.parameters()) + sum(
             p.numel() for p in self.ple.parameters()
@@ -409,243 +297,121 @@ class LlamaLEC(LlamaForCausalLM):
         print(
             f"[LEC] Base: {base:,} | LEC overhead: {lec:,} ({100 * lec / (base + lec):.3f}%)"
         )
-        print(f"[LEC] Using {num_layers} per-layer routers, one per transformer layer.")
-
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """RoPE helper: rotate last-dimension halves."""
-        half = x.shape[-1] // 2
-        x1 = x[..., :half]
-        x2 = x[..., half:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    @staticmethod
-    def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """Repeat KV heads for grouped-query attention.
-
-        Input:  [B, H_kv, T, D]
-        Output: [B, H_kv * n_rep, T, D]
-        """
-        if n_rep == 1:
-            return x
-        bsz, num_kv_heads, seq_len, head_dim = x.shape
-        x = x[:, :, None, :, :].expand(bsz, num_kv_heads, n_rep, seq_len, head_dim)
-        return x.reshape(bsz, num_kv_heads * n_rep, seq_len, head_dim)
-
-    def _manual_decoder_layer_forward(
-        self,
-        layer: nn.Module,
-        hidden_states: torch.Tensor,
-        position_embeddings,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Manual LLaMA decoder layer forward.
-
-        This avoids calling HF LlamaAttention.forward directly. In the user's
-        installed transformers build, manual decoder-layer calls expose a RoPE
-        broadcast mismatch inside apply_rotary_pos_emb. Here we explicitly keep
-        Q/K/V in [B, heads, T, head_dim] layout and apply RoPE ourselves.
-        """
-        bsz, seq_len, _ = hidden_states.shape
-        attn = layer.self_attn
-
-        # Attention block
-        residual = hidden_states
-        x = layer.input_layernorm(hidden_states)
-
-        num_heads = getattr(attn, "num_heads", self.config.num_attention_heads)
-        num_kv_heads = getattr(
-            attn, "num_key_value_heads", self.config.num_key_value_heads
-        )
-        head_dim = getattr(attn, "head_dim", self.config.hidden_size // num_heads)
-        n_rep = num_heads // num_kv_heads
-
-        q = attn.q_proj(x).view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
-        k = attn.k_proj(x).view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-        v = attn.v_proj(x).view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-
-        cos, sin = position_embeddings  # expected [B, T, D]
-        cos = cos[:, :seq_len, :].unsqueeze(1).to(dtype=q.dtype)  # [B,1,T,D]
-        sin = sin[:, :seq_len, :].unsqueeze(1).to(dtype=q.dtype)  # [B,1,T,D]
-        q = (q * cos) + (self._rotate_half(q) * sin)
-        k = (k * cos) + (self._rotate_half(k) * sin)
-
-        k = self._repeat_kv(k, n_rep)
-        v = self._repeat_kv(v, n_rep)
-
-        # Packed dataset has no padding. If a mask is ever supplied, combine it
-        # with an explicit causal mask; otherwise use SDPA's efficient causal path.
-        sdpa_mask = None
-        is_causal = True
-        if attention_mask is not None:
-            if attention_mask.dim() == 2 and not bool(attention_mask.all()):
-                pad = attention_mask[:, None, None, :].to(torch.bool)
-                causal = torch.ones(
-                    seq_len, seq_len, device=hidden_states.device, dtype=torch.bool
-                ).tril()
-                sdpa_mask = pad & causal[None, None, :, :]
-                is_causal = False
-            elif attention_mask.dim() == 4:
-                sdpa_mask = attention_mask
-                is_causal = False
-
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=sdpa_mask,
-            dropout_p=0.0,
-            is_causal=is_causal,
-        )
-        attn_out = (
-            attn_out.transpose(1, 2)
-            .contiguous()
-            .view(bsz, seq_len, self.config.hidden_size)
-        )
-        attn_out = attn.o_proj(attn_out)
-        hidden_states = residual + attn_out
-
-        # MLP block
-        residual = hidden_states
-        x = layer.post_attention_layernorm(hidden_states)
-        x = layer.mlp(x)
-        hidden_states = residual + x
-        return hidden_states
-
-    @_dynamo_disable
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> CausalLMOutputWithPast:
-        """
-        Custom forward loop that applies per-layer PLE conditioning.
-        Replaces the hook-based approach with an explicit layer-by-layer pass.
-        """
-        # --- embedding ---
-        h = self.model.embed_tokens(input_ids)
-
-        # Build cache_position / position_ids the same way modern HF LLaMA expects.
-        # Newer transformers LLaMA decoder layers require precomputed RoPE
-        # position_embeddings=(cos, sin), passed into every layer.
-        seq_len = input_ids.shape[1]
-        cache_position = torch.arange(0, seq_len, device=input_ids.device)
-        position_ids = cache_position.unsqueeze(0).expand(input_ids.shape[0], -1)
-
-        # Shared RoPE embeddings for all decoder layers. Without this, recent
-        # transformers versions fail inside LlamaAttention with:
-        #   TypeError: cannot unpack non-iterable NoneType object
-        position_embeddings = self.model.rotary_emb(h, position_ids)
-
-        # --- per-layer forward with PLE injection ---
-        collect_lec_metrics = bool(getattr(self, "log_lec_metrics", False))
-        all_biased_logits = [] if collect_lec_metrics else None
-        all_expert_ids = [] if collect_lec_metrics else None
-
-        causal_mask = (
-            self.model._update_causal_mask(
-                attention_mask, h, cache_position, None, False
-            )
-            if hasattr(self.model, "_update_causal_mask")
-            else attention_mask
+        print(
+            f"[LEC] Using {self.num_layers} per-layer routers via decoder-layer pre-hooks."
         )
 
+    def _install_lec_hooks(self):
         for layer_idx, layer in enumerate(self.model.layers):
-            router = self.routers[layer_idx]
-            expert_ids, gate, router_logits, biased_logits, router_probs = router(h)
-
-            ple_all = self.ple.get_all_projected(layer_idx).to(dtype=h.dtype)  # [K, H]
-            ple_shift = torch.matmul(gate, ple_all)  # [B, T, H]
-            h = h + ple_shift
-
-            h = self._manual_decoder_layer_forward(
-                layer,
-                h,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
+            handle = layer.register_forward_pre_hook(
+                self._make_layer_pre_hook(layer_idx), with_kwargs=True
             )
+            self._hook_handles.append(handle)
 
-            if collect_lec_metrics:
-                # Detach so metric collection never keeps the training graph alive.
-                all_expert_ids.append(expert_ids.detach())
-                all_biased_logits.append(biased_logits.detach())
+    def _make_layer_pre_hook(self, layer_idx: int):
+        def hook(module, args, kwargs):
+            if len(args) > 0:
+                hidden_states = args[0]
+                rest_args = args[1:]
+            else:
+                hidden_states = kwargs["hidden_states"]
+                rest_args = ()
 
-            # Accumulate hard realized load for gradient-free lb_bias update.
+            router = self.routers[layer_idx]
+            expert_ids, gate, _logits, biased_logits, _probs = router(hidden_states)
+
+            ple_all = self.ple.get_all_projected(layer_idx).to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )  # [K, H]
+            ple_shift = torch.matmul(gate, ple_all)  # [B, T, H]
+            hidden_states = hidden_states + ple_shift
+
             if self.training:
                 router.accumulate_load(expert_ids)
 
-        # --- final norm + lm_head ---
-        h = self.model.norm(h)
-        logits = self.lm_head(h)
-
-        # --- loss ---
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
-
-        # --- optional no-grad diagnostics ---
-        # Toggled by LECTrainer every N optimizer steps. They are never part of
-        # the training graph and are absent on normal steps.
-        lec_metrics = None
-        if collect_lec_metrics:
-            with torch.no_grad():
-                router_soft_entropy = sum(
-                    router.soft_entropy_norm(bl.detach())
-                    for router, bl in zip(self.routers, all_biased_logits)
-                ) / len(all_biased_logits)
-
-                router_hard_entropy = sum(
-                    LECRouter.hard_load_entropy_norm(ei.detach(), self.num_experts)
-                    for ei in all_expert_ids
-                ) / len(all_expert_ids)
-
-                collapse_threshold = self.lec_config.get(
-                    "entropy_collapse_threshold", 0.5
-                )
-                if router_hard_entropy < collapse_threshold:
-                    print(
-                        f"[LEC][WARN] hard routing collapsed: "
-                        f"{router_hard_entropy:.4f} < {collapse_threshold}"
+            if self.log_lec_metrics:
+                with torch.no_grad():
+                    ei = expert_ids.detach()
+                    bl = biased_logits.detach()
+                    load = LECRouter.batch_load(ei, self.num_experts)
+                    self._metric_layer_records.append(
+                        {
+                            "soft_entropy": router.soft_entropy_norm(bl),
+                            "hard_entropy": LECRouter.hard_load_entropy_norm(
+                                ei, self.num_experts
+                            ),
+                            "load": load.detach(),
+                        }
                     )
 
-                loads = [
-                    LECRouter.batch_load(ei.detach(), self.num_experts)
-                    for ei in all_expert_ids
-                ]
-                load_stack = torch.stack(loads, dim=0)  # [L, K]
-                avg_load = load_stack.mean(dim=0)  # [K]
+            if len(args) > 0:
+                return (hidden_states, *rest_args), kwargs
+            new_kwargs = dict(kwargs)
+            new_kwargs["hidden_states"] = hidden_states
+            return args, new_kwargs
 
-                lec_metrics = {
-                    "router_soft_entropy": float(router_soft_entropy),
-                    "router_hard_entropy": float(router_hard_entropy),
-                    "router_entropy": float(router_hard_entropy),
-                    "ple_pairwise_cosine": float(self.ple.pairwise_cosine()),
-                    "expert_load_balance_std": float(
-                        avg_load.std(unbiased=False).item()
-                    ),
-                    "expert_load_balance_min": float(avg_load.min().item()),
-                    "expert_load_balance_max": float(avg_load.max().item()),
-                    "expert_load_max_any_layer": float(load_stack.max().item()),
-                    "expert_utilization": float((avg_load > 0).float().mean().item()),
-                }
+        return hook
 
-                avg_ema_load = torch.stack(
-                    [r.expert_ema_load.detach() for r in self.routers], dim=0
-                ).mean(dim=0)
-                for idx, load in enumerate(avg_ema_load.tolist()):
-                    lec_metrics[f"expert_ema_load_{idx}"] = float(load)
-                    lec_metrics[f"expert_load_{idx}"] = float(load)
+    def _reset_lec_metric_records(self):
+        self._metric_layer_records = []
 
-        # Do not return full logits. Accelerate may fp32-convert returned bf16
-        # tensors; [B, T, vocab] logits are ~12GB at this config.
-        out = CausalLMOutputWithPast(loss=loss, logits=None)
+    @torch.no_grad()
+    def _finalize_lec_metrics(self) -> dict:
+        if not self._metric_layer_records:
+            return {}
+
+        soft = [r["soft_entropy"] for r in self._metric_layer_records]
+        hard = [r["hard_entropy"] for r in self._metric_layer_records]
+        loads = torch.stack(
+            [r["load"] for r in self._metric_layer_records], dim=0
+        )  # [L, K]
+        avg_load = loads.mean(dim=0)
+
+        router_soft_entropy = float(sum(soft) / len(soft))
+        router_hard_entropy = float(sum(hard) / len(hard))
+
+        metrics = {
+            "router_soft_entropy": router_soft_entropy,
+            "router_hard_entropy": router_hard_entropy,
+            "router_entropy": router_hard_entropy,
+            "router_hard_entropy_min": float(min(hard)),
+            "ple_pairwise_cosine": self.ple.pairwise_cosine(),
+            "expert_load_balance_std": avg_load.std(unbiased=False).item(),
+            "expert_load_balance_min": avg_load.min().item(),
+            "expert_load_balance_max": avg_load.max().item(),
+            "expert_load_max_any_layer": loads.max().item(),
+            "expert_utilization": (avg_load > 0).float().mean().item(),
+        }
+
+        avg_ema_load = torch.stack(
+            [r.expert_ema_load.detach() for r in self.routers], dim=0
+        ).mean(dim=0)
+        for idx, load in enumerate(avg_ema_load.tolist()):
+            metrics[f"expert_ema_load_{idx}"] = float(load)
+            metrics[f"expert_load_{idx}"] = float(load)
+
+        collapse_threshold = self.lec_config.get("entropy_collapse_threshold", 0.5)
+        metrics["router_collapsed_layers"] = float(
+            sum(1 for x in hard if x < collapse_threshold)
+        )
+        return metrics
+
+    def forward(self, *args, **kwargs):
+        # Clear previous hook-collected metrics, call the official HF forward,
+        # then attach no-grad LEC metrics if Trainer requested them this step.
+        self._reset_lec_metric_records()
+        outputs = super().forward(*args, **kwargs)
+
+        lec_metrics = self._finalize_lec_metrics() if self.log_lec_metrics else {}
+
+        # During Trainer loss computation we only need loss. Returning full logits
+        # makes Accelerate convert [B,T,V] to fp32, which can add ~12GB for this run.
+        labels_present = kwargs.get("labels", None) is not None
+        if labels_present:
+            out = CausalLMOutputWithPast(loss=outputs.loss, logits=None)
+        else:
+            out = outputs
         out.lec_metrics = lec_metrics
         return out
 
@@ -671,9 +437,6 @@ def build_model(config: dict) -> LlamaLEC:
         attention_bias=config["attention_bias"],
         hidden_act=config["hidden_act"],
     )
-    # Be explicit: custom manual decoder-layer loop is safest with eager attention.
-    # Passing through _from_config alone is not always enough across transformers versions.
-    llama_cfg._attn_implementation = config["attn_implementation"]
     lec_config = {
         k: config[k]
         for k in [
@@ -684,24 +447,23 @@ def build_model(config: dict) -> LlamaLEC:
             "entropy_collapse_threshold",
         ]
     }
+
     model = LlamaLEC._from_config(
         llama_cfg,
         lec_config=lec_config,
         attn_implementation=config["attn_implementation"],
     )
     n = sum(p.numel() for p in model.parameters())
-    print(f"[Model] LLaMA + LEC: {n:,} params ({n / 1e9:.2f}B)")
+    print(f"[Model] LLaMA + LEC hooks: {n:,} params ({n / 1e9:.2f}B)")
     print(
-        f"[Attention] impl={getattr(model.config, '_attn_implementation', None)} | class={model.model.layers[0].self_attn.__class__.__name__}"
+        f"[Attention] impl={config['attn_implementation']} | class={model.model.layers[0].self_attn.__class__.__name__}"
     )
     return model
 
 
 def build_tokenizer(config: dict):
     tok = AutoTokenizer.from_pretrained(config["tokenizer_name"])
-    tok.model_max_length = int(
-        1e9
-    )  # packing enforces max_seq_len; avoid long-document tokenizer warnings
+    tok.model_max_length = config["max_seq_len"]
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     print(
@@ -716,6 +478,8 @@ def build_tokenizer(config: dict):
 
 
 class PackedFineWebDataset(IterableDataset):
+    """Streaming FineWeb with document packing to exact max_seq_len chunks."""
+
     def __init__(
         self,
         config: dict,
@@ -744,58 +508,37 @@ class PackedFineWebDataset(IterableDataset):
         self.epoch = epoch
 
     def __iter__(self):
-        # Shard streaming data across DataLoader workers and distributed ranks.
-        # Without this, IterableDataset workers can duplicate the same stream.
-        ds = self.dataset
-        worker = get_worker_info()
-        worker_id = worker.id if worker is not None else 0
-        num_workers = worker.num_workers if worker is not None else 1
-
-        rank = 0
-        world_size = 1
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-
-        num_shards = max(1, world_size * num_workers)
-        shard_index = rank * num_workers + worker_id
-        if num_shards > 1:
-            ds = ds.shard(num_shards=num_shards, index=shard_index)
-
-        ds = ds.shuffle(
-            seed=self.seed + self.epoch + shard_index, buffer_size=self.buffer_size
+        dataset = self.dataset.shuffle(
+            seed=self.seed + self.epoch, buffer_size=self.buffer_size
         )
-        it = iter(ds)
-        buf = []
-        n = 0
+        dataset_iter = iter(dataset)
+        buffer = []
+        examples_yielded = 0
+
         while True:
-            if self.max_examples is not None and n >= self.max_examples:
+            if self.max_examples is not None and examples_yielded >= self.max_examples:
                 return
-            while len(buf) < self.max_seq_len:
+
+            while len(buffer) < self.max_seq_len:
                 try:
-                    doc = next(it)
+                    doc = next(dataset_iter)
                 except StopIteration:
                     return
                 text = doc.get("text", "")
                 if not text or not text.strip():
                     continue
-                tokens = self.tokenizer(
-                    text,
-                    add_special_tokens=False,
-                    truncation=False,
-                    return_attention_mask=False,
-                    verbose=False,
-                )["input_ids"]
+                tokens = self.tokenizer.encode(text, add_special_tokens=False)
                 if tokens:
-                    buf.extend(tokens)
-                    buf.append(self.eos_id)
-            chunk = buf[: self.max_seq_len]
-            buf = buf[self.max_seq_len :]
+                    buffer.extend(tokens)
+                    buffer.append(self.eos_id)
+
+            chunk = buffer[: self.max_seq_len]
+            buffer = buffer[self.max_seq_len :]
             yield {
                 "input_ids": torch.tensor(chunk, dtype=torch.long),
                 "labels": torch.tensor(chunk, dtype=torch.long),
             }
-            n += 1
+            examples_yielded += 1
 
 
 # =============================================================================
@@ -805,87 +548,82 @@ class PackedFineWebDataset(IterableDataset):
 
 class LECTrainer(Trainer):
     """
-    Minimal HF Trainer extension:
-      - Uses the standard HF optimizer and cosine scheduler from TrainingArguments.
-      - Accumulates LEC metrics only every `lec_metric_log_every_steps` optimizer steps.
-      - Flushes per-layer router load-balancing state once per optimizer step.
-      - Adds perplexity logging.
+    Minimal Trainer extension:
+      - accumulates LEC metrics when enabled every N optimizer steps
+      - flushes router load-balancing bias once per optimizer step
+      - logs perplexity
+
+    Optimizer and LR scheduler are standard HF Trainer/TrainingArguments.
     """
 
     def __init__(self, *args, lec_metric_log_every_steps: int = 10, **kwargs):
         super().__init__(*args, **kwargs)
-        self.lec_metric_log_every_steps = max(1, int(lec_metric_log_every_steps))
-        self._metric_sums = {"train": {}, "eval": {}}
-        self._metric_counts = {"train": 0, "eval": 0}
+        self.lec_metric_log_every_steps = lec_metric_log_every_steps
+        self._metric_sums = {}
+        self._metric_count = 0
 
-    def _accumulate(self, split: str, metrics: dict):
+    def _accumulate_metrics(self, metrics: Optional[dict]):
         if not metrics:
             return
-        bucket = self._metric_sums[split]
         for k, v in metrics.items():
-            bucket[k] = bucket.get(k, 0.0) + float(v)
-        self._metric_counts[split] += 1
+            self._metric_sums[k] = self._metric_sums.get(k, 0.0) + float(v)
+        self._metric_count += 1
 
-    def _flush(self, split: str, prefix: str = "") -> dict:
-        count = self._metric_counts[split]
-        if count == 0:
+    def _flush_metrics(self) -> dict:
+        if self._metric_count == 0:
             return {}
-        out = {f"{prefix}{k}": v / count for k, v in self._metric_sums[split].items()}
-        self._metric_sums[split] = {}
-        self._metric_counts[split] = 0
+        out = {k: v / self._metric_count for k, v in self._metric_sums.items()}
+        self._metric_sums = {}
+        self._metric_count = 0
         return out
-
-    def _should_collect_lec_metrics(self, model) -> bool:
-        # While training, global_step is completed optimizer steps. For the
-        # upcoming optimizer step, use global_step + 1 so metrics at N=10 land
-        # in the step-10 log and cover all micro-steps for that step.
-        target_step = (
-            self.state.global_step + 1 if model.training else self.state.global_step
-        )
-        return target_step > 0 and (target_step % self.lec_metric_log_every_steps == 0)
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         unwrapped = self.accelerator.unwrap_model(model)
-        should_collect = self._should_collect_lec_metrics(model)
+        should_log_lec = (
+            self.lec_metric_log_every_steps > 0
+            and self.state.global_step > 0
+            and self.state.global_step % self.lec_metric_log_every_steps == 0
+        )
         if hasattr(unwrapped, "log_lec_metrics"):
-            unwrapped.log_lec_metrics = should_collect
-        try:
-            outputs = model(**inputs)
-        finally:
-            if hasattr(unwrapped, "log_lec_metrics"):
-                unwrapped.log_lec_metrics = False
+            unwrapped.log_lec_metrics = should_log_lec
 
+        outputs = model(**inputs)
         loss = outputs.loss
-        split = "train" if model.training else "eval"
-        self._accumulate(split, getattr(outputs, "lec_metrics", None))
+
+        if should_log_lec:
+            self._accumulate_metrics(getattr(outputs, "lec_metrics", None))
+
+        if hasattr(unwrapped, "log_lec_metrics"):
+            unwrapped.log_lec_metrics = False
+
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         loss = super().training_step(model, inputs, num_items_in_batch)
+
         if self.accelerator.sync_gradients:
             unwrapped = self.accelerator.unwrap_model(model)
             if hasattr(unwrapped, "routers"):
                 for router in unwrapped.routers:
                     router.flush_load_balance()
-            elif hasattr(unwrapped, "router"):
-                unwrapped.router.flush_load_balance()
         return loss
 
     def log(self, logs, start_time=None):
         if "loss" in logs:
             try:
-                logs["ppl"] = round(math.exp(min(logs["loss"], 20)), 2)
+                logs["ppl"] = round(math.exp(min(float(logs["loss"]), 20)), 2)
             except Exception:
                 pass
-            logs.update(self._flush("train"))
+            logs.update(self._flush_metrics())
+
         if "eval_loss" in logs:
             try:
-                logs["eval_ppl"] = round(math.exp(min(logs["eval_loss"], 20)), 2)
+                logs["eval_ppl"] = round(math.exp(min(float(logs["eval_loss"]), 20)), 2)
             except Exception:
                 pass
-            logs.update(self._flush("eval", prefix="eval_"))
+
         if start_time is not None:
             super().log(logs, start_time)
         else:
@@ -904,6 +642,9 @@ def train(config: dict):
     tokenizer = build_tokenizer(config)
 
     if len(tokenizer) != model.config.vocab_size:
+        print(
+            f"[Warning] Resizing embeddings: {model.config.vocab_size} -> {len(tokenizer)}"
+        )
         model.resize_token_embeddings(len(tokenizer))
 
     train_ds = PackedFineWebDataset(config, tokenizer, seed=config["seed"])
@@ -944,12 +685,12 @@ def train(config: dict):
         save_strategy="steps",
         save_steps=config["save_every_steps"],
         save_only_model=True,
-        save_total_limit=3,
+        save_total_limit=10,
         dataloader_num_workers=config["dataloader_workers"],
         dataloader_prefetch_factor=config["dataloader_prefetch_factor"],
         seed=config["seed"],
         report_to="wandb" if config["use_wandb"] else "none",
-        run_name="llama_lec",
+        run_name="llama_lec_hooks",
         remove_unused_columns=False,
         label_names=["labels"],
         torch_compile=config["torch_compile"],
@@ -961,11 +702,11 @@ def train(config: dict):
         args=args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        lec_metric_log_every_steps=config.get("lec_metric_log_every_steps", 10),
+        lec_metric_log_every_steps=config["lec_metric_log_every_steps"],
     )
 
     trainer.train()
-    print("[Train] LLaMA LEC pretraining complete.")
+    print("[Train] LLaMA LEC hook-based pretraining complete.")
 
 
 if __name__ == "__main__":

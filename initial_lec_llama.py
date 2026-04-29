@@ -1,5 +1,5 @@
 """
-LEC Pretraining - LLaMA + PLE + Router via HuggingFace Trainer
+LEC Pretraining - LLaMA + PLE + Router via HuggingFace Trainer - Latest with fixes pointed out by opus
 ==============================================================
 
 Hook-based implementation: preserves the official HuggingFace LlamaForCausalLM
@@ -18,13 +18,13 @@ No custom layer loop. No manual attention implementation. No custom LR scheduler
 
 CONFIG = {
     # Model
-    "hidden_size": 2048,
-    "num_hidden_layers": 16,
+    "hidden_size": 512,
+    "num_hidden_layers": 12,
     "num_attention_heads": 16,
     "num_key_value_heads": 8,
-    "intermediate_size": 8192,
+    "intermediate_size": 4096,
     "vocab_size": 128256,
-    "max_position_embeddings": 4096,
+    "max_position_embeddings": 2048,
     "rope_theta": 10000.0,
     "rms_norm_eps": 1e-6,
     "initializer_range": 0.02,
@@ -34,7 +34,7 @@ CONFIG = {
     "attn_implementation": "flash_attention_2",
     "tokenizer_name": "meta-llama/Llama-3.2-1B",
     # LEC (Phase 1: PLE + Router only)
-    "num_experts": 8,
+    "num_experts": 4,
     "ple_dim": 512,
     "lb_ema_alpha": 0.1,
     "lb_bias_lr": 1e-3,
@@ -47,18 +47,18 @@ CONFIG = {
     "beta1": 0.9,
     "beta2": 0.95,
     "grad_clip": 1.0,
-    "warmup_steps": 250,
-    "max_steps": 2500,
-    "per_device_batch_size": 12,
-    "grad_accum_steps": 8,
-    "max_seq_len": 2048,
+    "warmup_steps": 25,
+    "max_steps": 500,
+    "per_device_batch_size": 6,
+    "grad_accum_steps": 4,
+    "max_seq_len": 256,
     # Data
     "dataset_name": "HuggingFaceFW/fineweb",
     "dataset_config": "sample-10BT",
     "streaming_buffer_size": 10_000,
     "eval_max_examples": 256,
     # Eval
-    "eval_every_steps": 500,
+    "eval_every_steps": 100,
     "save_every_steps": 250,
     "log_every_steps": 1,
     # Misc
@@ -588,6 +588,15 @@ class LECTrainer(Trainer):
         )
         if hasattr(unwrapped, "log_lec_metrics"):
             unwrapped.log_lec_metrics = should_log_lec
+
+        # Recent HF Trainer versions pass num_items_in_batch to support
+        # correct gradient-accumulation loss scaling. Because LlamaLEC.forward
+        # accepts **kwargs, Trainer marks the model as accepting loss kwargs and
+        # will not apply its old loss /= grad_accum_steps fallback. Therefore we
+        # must forward num_items_in_batch to the model when provided. Otherwise
+        # the logged/training loss is effectively multiplied by grad_accum_steps.
+        if num_items_in_batch is not None:
+            inputs = {**inputs, "num_items_in_batch": num_items_in_batch}
 
         outputs = model(**inputs)
         loss = outputs.loss

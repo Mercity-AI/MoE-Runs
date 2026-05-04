@@ -22,7 +22,7 @@ CONFIG = {
     "num_hidden_layers": 12,
     "num_attention_heads": 16,
     "num_key_value_heads": 8,
-    "intermediate_size": 4096,
+    "intermediate_size": 8192,
     "vocab_size": 128256,
     "max_position_embeddings": 2048,
     "rope_theta": 10000.0,

@@ -54,9 +54,9 @@ CONFIG = {
     "tie_word_embeddings": True,
     "attention_bias": False,
     "hidden_act": "silu",
-    "attn_implementation": "sdpa",
+    "attn_implementation": "flash_attention_4",
     # --- Tokenizer / HF assets ---
-    "tokenizer_name": "meta-llama/Llama-3.2-1B",
+    "tokenizer_name": "unsloth/Llama-3.2-1B",
     "hf_assets_dir": "./hf_assets_llama_500m_titan",
     # --- Optional kernels ---
     "use_liger_kernel": True,
@@ -65,7 +65,7 @@ CONFIG = {
         "swiglu": True,
         "rms_norm": True,
         "cross_entropy": False,
-        "fused_linear_cross_entropy": False,
+        "fused_linear_cross_entropy": True,
     },
     # --- Training ---
     "learning_rate": 3e-4,
@@ -101,6 +101,11 @@ CONFIG = {
     "trackio_server_url": None,
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
+    # NOTE: torch.compile + Liger fused_linear_cross_entropy produces unstable
+    # loss on this stack (transformers 5.8 / torch 2.11 / liger-kernel 0.8.0).
+    # Loss bounces between sane values and 17/60+ across steps — wrong grads.
+    # Compile alone (FLCE off) works; FLCE alone works. Don't combine until
+    # the upstream interaction is fixed. See flce_compile_results.md.
     "torch_compile": False,
     "torch_compile_mode": "default",
 }
@@ -194,11 +199,10 @@ def maybe_enable_liger_kernel(config: dict):
         ) from LIGER_IMPORT_ERROR
 
     liger_cfg = dict(config.get("liger_kernel_config", {}))
-    if liger_cfg.get("cross_entropy") or liger_cfg.get("fused_linear_cross_entropy"):
+    if liger_cfg.get("cross_entropy") and liger_cfg.get("fused_linear_cross_entropy"):
         raise ValueError(
-            "This script computes loss outside the HF model with TorchTitan's "
-            "CrossEntropyLoss, so Liger's cross-entropy kernels are not wired in. "
-            "Keep 'cross_entropy' and 'fused_linear_cross_entropy' set to False."
+            "Liger 'cross_entropy' and 'fused_linear_cross_entropy' are mutually "
+            "exclusive. Pick one (FLCE is preferred — fuses LM head + softmax + CE)."
         )
     apply_liger_kernel_to_llama(**liger_cfg)
     print0(f"[Liger] Enabled with config: {liger_cfg}")
@@ -795,21 +799,34 @@ def save_checkpoint(
 
 
 def forward_loss(
-    model, loss_fn, input_ids: torch.Tensor, device: torch.device
+    model,
+    loss_fn,
+    input_ids: torch.Tensor,
+    device: torch.device,
+    use_flce: bool,
 ) -> tuple[torch.Tensor, int]:
     """
     Single forward pass + loss computation.
 
-    Shifts logits and labels by 1 to form the standard causal LM objective:
-        loss = CE(logits[:, :-1, :], input_ids[:, 1:])
+    Two paths:
+      - use_flce=True  : pass labels=input_ids into the HF model. Liger's
+        fused_linear_cross_entropy patches LlamaForCausalLM so the LM head +
+        softmax + CE are fused — the (B, S, V) logits tensor never materializes.
+        Loss is mean-reduced internally; HF shifts labels by 1 inside forward.
+      - use_flce=False : original path — get logits, shift, hand to TorchTitan's
+        cross_entropy_loss for the externally-computed CE.
 
-    Returns (loss_scalar, num_tokens) where num_tokens is used by the caller
-    to weight the loss correctly across gradient accumulation steps and ranks.
+    Returns (loss_scalar, num_tokens). num_tokens counts the (S-1) prediction
+    positions per row so the caller can convert mean→sum across grad accum / DDP.
     """
     input_ids = input_ids.to(device, non_blocking=True)
-    # TorchTitan's HFTransformerModel.forward inspects args[0] for seq metadata,
-    # so input_ids must be passed positionally, not as a keyword argument.
-    # Plain HF LlamaForCausalLM accepts both, so positional is safe for both paths.
+
+    if use_flce:
+        outputs = model(input_ids, labels=input_ids)
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        local_tokens = input_ids.shape[0] * (input_ids.shape[1] - 1)
+        return loss, local_tokens
+
     outputs = model(input_ids)
     logits = outputs if isinstance(outputs, torch.Tensor) else outputs.logits
 
@@ -823,7 +840,9 @@ def forward_loss(
 
 
 @torch.no_grad()
-def evaluate(model, eval_loader: DataLoader, loss_fn, device: torch.device) -> dict:
+def evaluate(
+    model, eval_loader: DataLoader, loss_fn, device: torch.device, use_flce: bool
+) -> dict:
     model.eval()
     total_loss_sum = 0.0
     total_tokens = 0.0
@@ -831,7 +850,10 @@ def evaluate(model, eval_loader: DataLoader, loss_fn, device: torch.device) -> d
     eval_pbar = progress_bar(eval_loader, desc="eval", position=1)
     try:
         for batch in eval_pbar:
-            loss, token_count = forward_loss(model, loss_fn, batch["input_ids"], device)
+            with get_autocast_context(device):
+                loss, token_count = forward_loss(
+                    model, loss_fn, batch["input_ids"], device, use_flce
+                )
             total_loss_sum += loss.item() * token_count
             total_tokens += token_count
     finally:
@@ -927,7 +949,12 @@ def train(config: dict):
         job_config = build_torchtitan_job_config(config, get_world_size())
         optimizer = build_optimizer(model, job_config)
         scheduler = build_scheduler(optimizer, job_config)
-        loss_fn = build_torchtitan_ce_loss()
+        use_flce = bool(config.get("liger_kernel_config", {}).get("fused_linear_cross_entropy"))
+        loss_fn = None if use_flce else build_torchtitan_ce_loss()
+        if use_flce:
+            print0("[Loss] Liger fused_linear_cross_entropy ON (logits not materialized)")
+        else:
+            print0("[Loss] TorchTitan cross_entropy_loss (external, materializes logits)")
 
         local_tokens_per_update = (
             config["per_device_batch_size"]
@@ -978,7 +1005,7 @@ def train(config: dict):
 
                 with get_autocast_context(device):
                     normalized_loss, token_count = forward_loss(
-                        model, loss_fn, batch["input_ids"], device
+                        model, loss_fn, batch["input_ids"], device, use_flce
                     )
                     loss = normalized_loss / config["grad_accum_steps"]
 
@@ -1025,7 +1052,7 @@ def train(config: dict):
                     )
 
             if step % config["eval_every_steps"] == 0:
-                metrics = evaluate(model, eval_loader, loss_fn, device)
+                metrics = evaluate(model, eval_loader, loss_fn, device, use_flce)
                 print0(
                     f"[Eval  {step:05d}] loss={metrics['eval_loss']:.4f} | "
                     f"ppl={metrics['eval_ppl']:.2f}"

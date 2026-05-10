@@ -1,0 +1,18 @@
+# Core training / eval dependencies
+torch
+transformers
+datasets
+accelerate
+wandb
+tiktoken
+sentencepiece
+protobuf
+lm-eval
+
+# TorchTitan-backed scripts
+torchtitan
+
+# Optional CUDA accelerators
+# Install these only in a compatible Linux/CUDA environment.
+flash-attn
+# liger-kernel

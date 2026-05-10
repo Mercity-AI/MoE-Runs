@@ -4,10 +4,12 @@ transformers
 datasets
 accelerate
 wandb
+trackio
 tiktoken
 sentencepiece
 protobuf
 lm-eval
+tqdm
 
 # TorchTitan-backed scripts
 torchtitan

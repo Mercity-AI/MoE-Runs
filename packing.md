@@ -42,8 +42,8 @@ The hard part isn't the kernel — that's installed and working
 those `cu_seqlens` tensors from the dataset all the way down into the
 attention layer of every transformer block.
 
-There are five different ways to do that plumbing. **Option 2 was the
-chosen path.**
+There are five different ways to do that plumbing. **Option 2 is the
+implemented path for the FA4-backed scripts in this repo.**
 
 ---
 
@@ -208,7 +208,13 @@ seq=4096+, marginal at seq=2048.
 
 We are using **Option 2 (HF model with explicit `cu_seq_lens_q/k` kwargs)**.
 Within Option 2, three sub-options exist for *how* to produce those four
-values; we are using **sub-option A (TorchTitan's helper)**.
+values. The current implementation computes doc-restart `position_ids`,
+derives `cu_seq_lens_q/k` and `max_length_q/k` from them, and passes all of
+that explicitly into the HF model forward.
+
+This varlen path is only active when the effective attention backend is
+`flash_attention_4`. If a script falls back to `sdpa`, it keeps the old
+naive concat-pack behavior because SDPA does not consume the FA4 varlen kwargs.
 
 ### Why Option 2
 
@@ -304,7 +310,8 @@ no cu_seqlens logic.
 
 ## Implementation sketch (Option 2 + sub-option A)
 
-This is the diff to land. Not yet committed — just the plan.
+This matches the implementation landed in `baseline_llama_torchtitan.py`
+and the FA4-gated path in `baseline_fa4_patched (1).py`.
 
 ### 1. Dataset (`PackedFineWebDataset.__iter__`)
 

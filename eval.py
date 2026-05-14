@@ -24,16 +24,17 @@ TASKS = ["hellaswag", "winogrande"]
 NUM_SHOTS = 0  # zero-shot; set to 5 for few-shot
 
 
-def run(checkpoint: str):
+def run(checkpoint: str, tokenizer: str = None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[eval] loading {checkpoint} on {device}")
     print(f"[eval] tasks: {TASKS} | shots: {NUM_SHOTS}\n")
 
     lm = HFLM(
         pretrained=checkpoint,
-        tokenizer=TOKENIZER,
+        tokenizer=tokenizer or checkpoint,
         dtype=torch.bfloat16,
         device=device,
+        attn_implementation="eager",
     )
 
     results = evaluator.simple_evaluate(
@@ -63,7 +64,8 @@ def run(checkpoint: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default=CHECKPOINT)
+    parser.add_argument("--tokenizer", default=None)
     parser.add_argument("--shots", type=int, default=NUM_SHOTS)
     args = parser.parse_args()
     NUM_SHOTS = args.shots
-    run(args.checkpoint)
+    run(args.checkpoint, tokenizer=args.tokenizer)

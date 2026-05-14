@@ -42,13 +42,13 @@ Distributed:
 CONFIG = {
     # --- Model: ~500M LLaMA-style ---
     "hidden_size": 1536,
-    "num_hidden_layers": 12,
+    "num_hidden_layers": 16,
     "num_attention_heads": 12,
     "num_key_value_heads": 6,
-    "intermediate_size": 4096,
-    "vocab_size": 128256,
-    "max_position_embeddings": 2048,
-    "rope_theta": 10000.0,
+    "intermediate_size": 4608,
+    "vocab_size": 32000,
+    "max_position_embeddings": 8192,
+    "rope_theta": 500000.0,
     "rms_norm_eps": 1e-6,
     "initializer_range": 0.02,
     "tie_word_embeddings": True,
@@ -56,7 +56,7 @@ CONFIG = {
     "hidden_act": "silu",
     "attn_implementation": "flash_attention_4",
     # --- Tokenizer / HF assets ---
-    "tokenizer_name": "unsloth/Llama-3.2-1B",
+    "tokenizer_name": "meta-llama/Llama-2-7b",
     "hf_assets_dir": "./hf_assets_llama_500m_titan",
     # --- Optional kernels ---
     "use_liger_kernel": True,
@@ -68,21 +68,32 @@ CONFIG = {
         "fused_linear_cross_entropy": True,
     },
     # --- Training ---
+    "optimizer_name": "muon",
     "learning_rate": 3e-4,
     "weight_decay": 0.1,
     "beta1": 0.9,
     "beta2": 0.95,
     "optimizer_eps": 1e-8,
     "optimizer_implementation": "fused",
+    "muon_lr": 0.02,
+    "muon_momentum": 0.95,
+    "muon_nesterov": True,
+    "muon_ns_steps": 5,
+    "muon_weight_decay": 0.1,
+    "aux_adam_lr": 3e-4,
+    "aux_adam_beta1": 0.9,
+    "aux_adam_beta2": 0.95,
+    "aux_adam_eps": 1e-8,
+    "aux_adam_weight_decay": 0.1,
     "grad_clip": 1.0,
-    "warmup_steps": 200,
+    "warmup_steps": 100,
     "lr_decay_type": "cosine",
     "lr_decay_ratio": None,
     "min_lr_factor": 0.1,
-    "max_steps": 2500,
-    "per_device_batch_size": 15,
+    "max_steps": 3_053,
+    "per_device_batch_size": 20,
     "grad_accum_steps": 8,
-    "max_seq_len": 2048,
+    "max_seq_len": 8192,
     # --- Data ---
     "dataset_name": "HuggingFaceFW/fineweb",
     "dataset_config": "sample-10BT",
@@ -90,15 +101,15 @@ CONFIG = {
     "eval_max_examples": 512,
     # --- Eval & logging ---
     "eval_every_steps": 500,
-    "save_every_steps": 1000,
+    "eval_benchmarks": False,
+    "save_every_steps": 500,
     "log_every_steps": 1,
     # --- Misc ---
     "seed": 42,
-    "output_dir": "./checkpoints_llama_500m_baseline_torchtitan",
-    "use_trackio": True,
-    "trackio_project": "llama-500m-baseline-torchtitan",
-    "trackio_space_id": None,
-    "trackio_server_url": None,
+    "resume_from_checkpoint": None,  # e.g. "./checkpoints_llama_500m_4b/step_001500_hf"
+    "output_dir": "./checkpoints_llama_500m_4b",
+    "use_wandb": True,
+    "wandb_project": "llama-500m-4b-torchtitan",
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
     # NOTE: torch.compile + Liger fused_linear_cross_entropy produces unstable
@@ -117,19 +128,27 @@ CONFIG = {
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
 
-import trackio as wandb
 import torch
 import torch.distributed as dist
+import wandb
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
+if hasattr(torch.optim, "Muon"):
+    MUON_IMPORT_ERROR = None
+else:
+    MUON_IMPORT_ERROR = ImportError(
+        "torch.optim.Muon not available — requires PyTorch >= 2.11"
+    )
 
 try:
     from liger_kernel.transformers import apply_liger_kernel_to_llama
@@ -188,6 +207,53 @@ def require_torchtitan():
         )
 
 
+def require_muon():
+    if MUON_IMPORT_ERROR is not None:
+        raise ImportError(
+            "Muon requires PyTorch >= 2.11 (torch.optim.Muon).\n"
+            f"Original error: {MUON_IMPORT_ERROR}"
+        ) from MUON_IMPORT_ERROR
+
+
+def resolve_optimizer_name(config: dict) -> str:
+    name = str(config.get("optimizer_name", "adamw")).strip().lower()
+    if name in {"adamw", "adam"}:
+        return "adamw"
+    if name == "muon":
+        return "muon"
+    raise NotImplementedError(f"Unsupported optimizer: {config.get('optimizer_name')}")
+
+
+def is_no_decay_param(name: str, param: torch.nn.Parameter) -> bool:
+    return param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower()
+
+
+def is_muon_hidden_param(name: str, param: torch.nn.Parameter) -> bool:
+    return name.startswith("model.layers.") and param.ndim >= 2
+
+
+def format_optimizer_log(config: dict, job_config: JobConfig) -> list[str]:
+    optimizer_name = resolve_optimizer_name(config)
+    if optimizer_name == "muon":
+        return [
+            "[Optim] Muon(hidden) + AuxAdam(non-hidden)",
+            (
+                "[Optim] "
+                f"muon_lr={config.get('muon_lr', 0.02):.3e} | "
+                f"muon_momentum={config.get('muon_momentum', 0.95):.2f} | "
+                f"muon_wd={config.get('muon_weight_decay', config['weight_decay']):.3e} | "
+                f"aux_lr={config.get('aux_adam_lr', config['learning_rate']):.3e} | "
+                f"aux_betas=({config.get('aux_adam_beta1', config['beta1']):.2f}, "
+                f"{config.get('aux_adam_beta2', config['beta2']):.2f}) | "
+                f"aux_eps={config.get('aux_adam_eps', config['optimizer_eps']):.1e}"
+            ),
+        ]
+    return [
+        f"[Optim] {job_config.optimizer.name} | "
+        f"impl={job_config.optimizer.implementation}"
+    ]
+
+
 def maybe_enable_liger_kernel(config: dict):
     if not config.get("use_liger_kernel", False):
         return
@@ -206,6 +272,22 @@ def maybe_enable_liger_kernel(config: dict):
         )
     apply_liger_kernel_to_llama(**liger_cfg)
     print0(f"[Liger] Enabled with config: {liger_cfg}")
+
+
+def resolve_attention_forward_kwargs(config: dict) -> dict:
+    kwargs = dict(config.get("attention_forward_kwargs", {}))
+    uses_gqa = config["num_attention_heads"] != config["num_key_value_heads"]
+
+    if (
+        config["attn_implementation"] == "flash_attention_4"
+        and uses_gqa
+        and "pack_gqa" not in kwargs
+    ):
+        # Keep FA4 on the non-packed GQA path; the packed path is the one that
+        # previously crashed in flash_attn/cute/pack_gqa.py on this stack.
+        kwargs["pack_gqa"] = False
+
+    return kwargs
 
 
 def is_dist_available_and_initialized() -> bool:
@@ -296,21 +378,58 @@ def get_autocast_context(device: torch.device):
 
 
 def maybe_init_tracker(config: dict):
-    if not config["use_trackio"] or not is_main_process():
+    if not config["use_wandb"] or not is_main_process():
         return None
 
-    init_kwargs = {
-        "project": config["trackio_project"],
-        "name": "llama_baseline_torchtitan",
-        "config": config,
-    }
-    if config.get("trackio_space_id"):
-        init_kwargs["space_id"] = config["trackio_space_id"]
-    if config.get("trackio_server_url"):
-        init_kwargs["server_url"] = config["trackio_server_url"]
-
-    wandb.init(**init_kwargs)
+    wandb.init(
+        project=config["wandb_project"],
+        name="llama_baseline_torchtitan",
+        config=config,
+    )
     return wandb
+
+
+def run_lm_benchmarks(
+    model: torch.nn.Module,
+    hf_assets_dir: Path,
+    device: torch.device,
+    tasks: tuple = ("hellaswag", "winogrande"),
+    num_fewshot: int = 0,
+) -> dict:
+    if not is_main_process():
+        return {}
+    try:
+        from lm_eval import evaluator
+        from lm_eval.models.huggingface import HFLM
+    except ImportError:
+        print0("[Bench] lm_eval not installed — skipping. pip install lm-eval")
+        return {}
+
+    base_model = unwrap_model(model)
+    base_model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(hf_assets_dir)
+
+    lm = HFLM(
+        pretrained=base_model,
+        tokenizer=tokenizer,
+        dtype=torch.bfloat16,
+        device=str(device),
+        batch_size=4,
+    )
+    results = evaluator.simple_evaluate(
+        model=lm,
+        tasks=list(tasks),
+        num_fewshot=num_fewshot,
+        log_samples=False,
+    )
+    base_model.train()
+
+    metrics = {}
+    for task, task_metrics in results["results"].items():
+        for metric, value in task_metrics.items():
+            if isinstance(value, float):
+                metrics[f"bench/{task}/{metric}"] = value
+    return metrics
 
 
 # =============================================================================
@@ -488,11 +607,16 @@ def build_direct_hf_model(config: dict, hf_assets_dir: Path) -> LlamaForCausalLM
     _init_weights via model.apply() to restore correct weight initialization.
     """
     llama_cfg = LlamaConfig.from_pretrained(hf_assets_dir)
+    # Ensure RoPE covers the full runtime seq len regardless of what was saved.
+    llama_cfg.max_position_embeddings = max(
+        llama_cfg.max_position_embeddings, config["max_seq_len"]
+    )
 
     with _patch_initialize_weights_compat():
         model = LlamaForCausalLM._from_config(
             llama_cfg,
             attn_implementation=config["attn_implementation"],
+            dtype=torch.bfloat16,
         )
 
     # Manually re-run per-module weight init now that construction is done.
@@ -552,9 +676,8 @@ class PackedFineWebDataset(IterableDataset):
         max_examples: Optional[int] = None,
         rank: int = 0,
         world_size: int = 1,
+        base_dataset=None,
     ):
-        from datasets import load_dataset
-
         self.tokenizer = tokenizer
         self.max_seq_len = config["max_seq_len"]
         self.eos_id = tokenizer.eos_id
@@ -565,15 +688,19 @@ class PackedFineWebDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
 
-        self.base_dataset = load_dataset(
-            config["dataset_name"],
-            name=config["dataset_config"],
-            split="train",
-            streaming=True,
-        )
-        print0(
-            f"[Data] {config['dataset_name']} / {config['dataset_config']} streaming"
-        )
+        if base_dataset is not None:
+            self.base_dataset = base_dataset
+        else:
+            from datasets import load_dataset
+
+            self.base_dataset = load_dataset(
+                config["dataset_name"],
+                name=config["dataset_config"],
+                split="train",
+            )
+            print0(
+                f"[Data] {config['dataset_name']} / {config['dataset_config']} downloaded"
+            )
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
@@ -592,7 +719,6 @@ class PackedFineWebDataset(IterableDataset):
     def __iter__(self):
         dataset = self.base_dataset.shuffle(
             seed=self.seed + self.epoch,
-            buffer_size=self.buffer_size,
         )
         dataset = self._split_for_process_and_worker(dataset)
         dataset_iter = iter(dataset)
@@ -647,18 +773,30 @@ def build_dataloader(
 
 def build_torchtitan_job_config(config: dict, world_size: int) -> JobConfig:
     require_torchtitan()
+    optimizer_name = resolve_optimizer_name(config)
 
     job_config = JobConfig()
     job_config.job.dump_folder = str(Path(config["output_dir"]).resolve())
-    job_config.optimizer.name = "AdamW"
-    job_config.optimizer.lr = config["learning_rate"]
+    job_config.optimizer.name = "Muon" if optimizer_name == "muon" else "AdamW"
+    job_config.optimizer.lr = (
+        config.get("muon_lr", 0.02)
+        if optimizer_name == "muon"
+        else config["learning_rate"]
+    )
     job_config.optimizer.beta1 = config["beta1"]
     job_config.optimizer.beta2 = config["beta2"]
     job_config.optimizer.eps = config["optimizer_eps"]
-    job_config.optimizer.weight_decay = config["weight_decay"]
-    job_config.optimizer.implementation = config.get("optimizer_implementation") or (
-        "fused" if torch.cuda.is_available() else "for-loop"
+    job_config.optimizer.weight_decay = (
+        config.get("muon_weight_decay", config["weight_decay"])
+        if optimizer_name == "muon"
+        else config["weight_decay"]
     )
+    if optimizer_name == "muon":
+        job_config.optimizer.implementation = "muon"
+    else:
+        job_config.optimizer.implementation = config.get(
+            "optimizer_implementation"
+        ) or ("fused" if torch.cuda.is_available() else "for-loop")
     job_config.lr_scheduler.warmup_steps = config["warmup_steps"]
     job_config.lr_scheduler.decay_ratio = config.get("lr_decay_ratio")
     job_config.lr_scheduler.decay_type = config.get("lr_decay_type", "cosine")
@@ -673,21 +811,118 @@ def build_torchtitan_job_config(config: dict, world_size: int) -> JobConfig:
     return job_config
 
 
-def build_optimizer(model: torch.nn.Module, job_config: JobConfig) -> AdamW:
-    """
-    Splits parameters into decay / no-decay groups following standard practice:
-      - 1-D tensors (biases, norm scale/shift) -> no weight decay
-      - everything else -> weight decay
+class _NativeMuonWithAuxAdam:
+    """Pairs torch.optim.Muon (hidden 2-D params) with AdamW (aux params).
 
-    Assumption: job_config.optimizer.name == "AdamW" (only supported optimizer here).
+    Exposes a unified param_groups list so that a single LambdaLR scheduler
+    can drive the LR multiplier for both optimizers simultaneously.
+    The list holds references to the same dicts used internally by each
+    optimizer, so LambdaLR's in-place `group['lr']` writes propagate.
     """
+
+    def __init__(self, muon: torch.optim.Muon, adam: AdamW):
+        self._muon = muon
+        self._adam = adam
+        self.param_groups = muon.param_groups + adam.param_groups
+
+    def step(self, closure=None):
+        self._muon.step(closure)
+        self._adam.step(closure)
+
+    def zero_grad(self, set_to_none: bool = True):
+        self._muon.zero_grad(set_to_none=set_to_none)
+        self._adam.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {"muon": self._muon.state_dict(), "adam": self._adam.state_dict()}
+
+    def load_state_dict(self, state_dict: dict):
+        self._muon.load_state_dict(state_dict["muon"])
+        self._adam.load_state_dict(state_dict["adam"])
+
+
+class _DualLRScheduler:
+    """Drives the same LR lambda over two separate LambdaLR schedulers."""
+
+    def __init__(self, sched_muon: LambdaLR, sched_adam: LambdaLR):
+        self._muon = sched_muon
+        self._adam = sched_adam
+
+    def step(self):
+        self._muon.step()
+        self._adam.step()
+
+    def get_last_lr(self) -> list:
+        return self._muon.get_last_lr()
+
+    def state_dict(self) -> dict:
+        return {"muon": self._muon.state_dict(), "adam": self._adam.state_dict()}
+
+    def load_state_dict(self, state_dict: dict):
+        self._muon.load_state_dict(state_dict["muon"])
+        self._adam.load_state_dict(state_dict["adam"])
+
+
+def build_optimizer(
+    model: torch.nn.Module, job_config: JobConfig, config: dict
+) -> torch.optim.Optimizer:
+    """
+    Builds either:
+      - AdamW with standard decay / no-decay groups
+      - Muon for hidden block matrix weights plus AdamW-style auxiliary groups
+    """
+    optimizer_name = resolve_optimizer_name(config)
+    base_model = unwrap_model(model)
+
+    if optimizer_name == "muon":
+        require_muon()
+        muon_params, aux_decay_params, aux_no_decay_params = [], [], []
+        for name, param in base_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if is_muon_hidden_param(name, param):
+                muon_params.append(param)
+            elif is_no_decay_param(name, param):
+                aux_no_decay_params.append(param)
+            else:
+                aux_decay_params.append(param)
+        if not muon_params:
+            raise RuntimeError("Muon partitioning found no hidden matrix parameters.")
+        muon_opt = torch.optim.Muon(
+            muon_params,
+            lr=config.get("muon_lr", 0.02),
+            momentum=config.get("muon_momentum", 0.95),
+            nesterov=config.get("muon_nesterov", True),
+            weight_decay=config.get("muon_weight_decay", config["weight_decay"]),
+            ns_steps=config.get("muon_ns_steps", 5),
+        )
+        aux_lr = config.get("aux_adam_lr", config["learning_rate"])
+        adam_opt = AdamW(
+            [
+                {
+                    "params": aux_decay_params,
+                    "weight_decay": config.get(
+                        "aux_adam_weight_decay", config["weight_decay"]
+                    ),
+                },
+                {"params": aux_no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=aux_lr,
+            betas=(
+                config.get("aux_adam_beta1", config["beta1"]),
+                config.get("aux_adam_beta2", config["beta2"]),
+            ),
+            eps=config.get("aux_adam_eps", config["optimizer_eps"]),
+        )
+        return _NativeMuonWithAuxAdam(muon_opt, adam_opt)
+
     decay_params = []
     no_decay_params = []
 
-    for name, param in model.named_parameters():
+    for name, param in base_model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower():
+        if is_no_decay_param(name, param):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -721,7 +956,9 @@ def build_optimizer(model: torch.nn.Module, job_config: JobConfig) -> AdamW:
     )
 
 
-def build_scheduler(optimizer: AdamW, job_config: JobConfig) -> LambdaLR:
+def build_scheduler(
+    optimizer: torch.optim.Optimizer, job_config: JobConfig
+) -> LambdaLR:
     """
     LR schedule:
       [0, warmup_steps)       -> linear warmup from 0 to peak LR
@@ -759,6 +996,11 @@ def build_scheduler(optimizer: AdamW, job_config: JobConfig) -> LambdaLR:
             raise NotImplementedError(f"Unsupported lr decay type: {decay_type}")
         return min_lr_factor + (1.0 - min_lr_factor) * decay
 
+    if isinstance(optimizer, _NativeMuonWithAuxAdam):
+        return _DualLRScheduler(
+            LambdaLR(optimizer._muon, lr_lambda=lr_lambda),
+            LambdaLR(optimizer._adam, lr_lambda=lr_lambda),
+        )
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
@@ -768,7 +1010,7 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def save_checkpoint(
     model: torch.nn.Module,
-    optimizer: AdamW,
+    optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     step: int,
     config: dict,
@@ -778,19 +1020,70 @@ def save_checkpoint(
 
     ckpt_dir = Path(config["output_dir"]).resolve()
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    path = ckpt_dir / f"step_{step:06d}.pt"
 
+    hf_dir = ckpt_dir / f"step_{step:06d}_hf"
+    unwrap_model(model).save_pretrained(hf_dir, safe_serialization=True)
+    tokenizer = AutoTokenizer.from_pretrained(Path(config["hf_assets_dir"]).resolve())
+    tokenizer.save_pretrained(hf_dir)
+
+    state_path = ckpt_dir / f"step_{step:06d}_train_state.pt"
     torch.save(
         {
             "step": step,
-            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "config": config,
         },
-        path,
+        state_path,
     )
-    print0(f"[Checkpoint] Saved {path}")
+    print0(f"[Checkpoint] HF model → {hf_dir}")
+    print0(f"[Checkpoint] Train state → {state_path}")
+
+
+def load_checkpoint(config: dict, hf_assets_dir: Path):
+    """
+    Load model weights and training state from a resume checkpoint.
+
+    Returns (model, start_step, opt_state_dict, sched_state_dict).
+    opt_state_dict / sched_state_dict are None if no train_state.pt is found
+    (e.g. checkpoint was saved by an older version of this script).
+    """
+    ckpt_path = Path(config["resume_from_checkpoint"]).resolve()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+
+    maybe_enable_liger_kernel(config)
+
+    llama_cfg = LlamaConfig.from_pretrained(ckpt_path)
+    llama_cfg.max_position_embeddings = max(
+        llama_cfg.max_position_embeddings, config["max_seq_len"]
+    )
+
+    with _patch_initialize_weights_compat():
+        model = LlamaForCausalLM.from_pretrained(
+            ckpt_path,
+            config=llama_cfg,
+            attn_implementation=config["attn_implementation"],
+            torch_dtype=torch.bfloat16,
+        )
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print0(f"[Resume] Loaded {n_params:,} params from {ckpt_path}")
+
+    match = re.search(r"step_(\d+)", ckpt_path.name)
+    start_step = int(match.group(1)) if match else 0
+    print0(f"[Resume] Resuming from step {start_step}")
+
+    state_path = ckpt_path.parent / f"step_{start_step:06d}_train_state.pt"
+    opt_state = sched_state = None
+    if state_path.exists():
+        saved = torch.load(state_path, map_location="cpu", weights_only=False)
+        opt_state = saved.get("optimizer")
+        sched_state = saved.get("scheduler")
+        print0(f"[Resume] Optimizer/scheduler state loaded from {state_path}")
+    else:
+        print0(f"[Resume] No train state at {state_path} — optimizer starts fresh")
+
+    return model, start_step, opt_state, sched_state
 
 
 # =============================================================================
@@ -804,6 +1097,7 @@ def forward_loss(
     input_ids: torch.Tensor,
     device: torch.device,
     use_flce: bool,
+    attention_forward_kwargs: Optional[dict] = None,
 ) -> tuple[torch.Tensor, int]:
     """
     Single forward pass + loss computation.
@@ -820,19 +1114,22 @@ def forward_loss(
     positions per row so the caller can convert mean→sum across grad accum / DDP.
     """
     input_ids = input_ids.to(device, non_blocking=True)
+    model_kwargs = dict(attention_forward_kwargs or {})
 
     if use_flce:
-        outputs = model(input_ids, labels=input_ids)
+        outputs = model(input_ids, labels=input_ids, **model_kwargs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
         local_tokens = input_ids.shape[0] * (input_ids.shape[1] - 1)
         return loss, local_tokens
 
-    outputs = model(input_ids)
+    outputs = model(input_ids, **model_kwargs)
     logits = outputs if isinstance(outputs, torch.Tensor) else outputs.logits
 
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
 
+    # NOTE: global_valid_tokens should be the global (all-reduce'd) token count
+    # for correct loss scaling in DDP. Using local count is fine for single-GPU.
     local_tokens = shift_labels.numel()
     local_tokens_tensor = torch.tensor(local_tokens, device=device, dtype=torch.float32)
     loss = loss_fn(shift_logits, shift_labels, local_tokens_tensor)
@@ -841,7 +1138,12 @@ def forward_loss(
 
 @torch.no_grad()
 def evaluate(
-    model, eval_loader: DataLoader, loss_fn, device: torch.device, use_flce: bool
+    model,
+    eval_loader: DataLoader,
+    loss_fn,
+    device: torch.device,
+    use_flce: bool,
+    attention_forward_kwargs: Optional[dict] = None,
 ) -> dict:
     model.eval()
     total_loss_sum = 0.0
@@ -852,7 +1154,12 @@ def evaluate(
         for batch in eval_pbar:
             with get_autocast_context(device):
                 loss, token_count = forward_loss(
-                    model, loss_fn, batch["input_ids"], device, use_flce
+                    model,
+                    loss_fn,
+                    batch["input_ids"],
+                    device,
+                    use_flce,
+                    attention_forward_kwargs,
                 )
             total_loss_sum += loss.item() * token_count
             total_tokens += token_count
@@ -890,7 +1197,15 @@ def train(config: dict):
             tokenizer_size = load_tokenizer_size_from_assets(hf_assets_dir)
 
         tokenizer = build_torchtitan_tokenizer(hf_assets_dir)
-        model = build_torchtitan_model(config, hf_assets_dir)
+        resume_ckpt = config.get("resume_from_checkpoint")
+        if resume_ckpt:
+            model, start_step, opt_state, sched_state = load_checkpoint(
+                config, hf_assets_dir
+            )
+        else:
+            model = build_torchtitan_model(config, hf_assets_dir)
+            start_step = 0
+            opt_state = sched_state = None
         model.to(device)
 
         # Resolve model config regardless of whether we ended up with the
@@ -922,12 +1237,27 @@ def train(config: dict):
                 output_device=device.index if device.type == "cuda" else None,
             )
 
+        from datasets import load_dataset
+
+        print0(
+            f"[Data] Loading {config['dataset_name']} / {config['dataset_config']}..."
+        )
+        raw_dataset = load_dataset(
+            config["dataset_name"],
+            name=config["dataset_config"],
+            split="train",
+        )
+        print0(
+            f"[Data] {config['dataset_name']} / {config['dataset_config']} downloaded"
+        )
+
         train_ds = PackedFineWebDataset(
             config,
             tokenizer,
             seed=config["seed"],
             rank=get_rank(),
             world_size=get_world_size(),
+            base_dataset=raw_dataset,
         )
         eval_examples_per_rank = math.ceil(
             config["eval_max_examples"] / get_world_size()
@@ -939,6 +1269,7 @@ def train(config: dict):
             max_examples=eval_examples_per_rank,
             rank=get_rank(),
             world_size=get_world_size(),
+            base_dataset=raw_dataset,
         )
 
         train_loader = build_dataloader(
@@ -947,14 +1278,29 @@ def train(config: dict):
         eval_loader = build_dataloader(eval_ds, config["per_device_batch_size"], config)
 
         job_config = build_torchtitan_job_config(config, get_world_size())
-        optimizer = build_optimizer(model, job_config)
+        optimizer = build_optimizer(model, job_config, config)
         scheduler = build_scheduler(optimizer, job_config)
-        use_flce = bool(config.get("liger_kernel_config", {}).get("fused_linear_cross_entropy"))
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+            print0("[Resume] Optimizer state restored.")
+        if sched_state is not None:
+            scheduler.load_state_dict(sched_state)
+            print0("[Resume] Scheduler state restored.")
+        attention_forward_kwargs = resolve_attention_forward_kwargs(config)
+        if attention_forward_kwargs:
+            print0(f"[Attention] Forward kwargs: {attention_forward_kwargs}")
+        use_flce = bool(
+            config.get("liger_kernel_config", {}).get("fused_linear_cross_entropy")
+        )
         loss_fn = None if use_flce else build_torchtitan_ce_loss()
         if use_flce:
-            print0("[Loss] Liger fused_linear_cross_entropy ON (logits not materialized)")
+            print0(
+                "[Loss] Liger fused_linear_cross_entropy ON (logits not materialized)"
+            )
         else:
-            print0("[Loss] TorchTitan cross_entropy_loss (external, materializes logits)")
+            print0(
+                "[Loss] TorchTitan cross_entropy_loss (external, materializes logits)"
+            )
 
         local_tokens_per_update = (
             config["per_device_batch_size"]
@@ -964,10 +1310,8 @@ def train(config: dict):
         global_tokens_per_update = local_tokens_per_update * get_world_size()
         print0(f"[Train] Local tokens/step:  {local_tokens_per_update:,}")
         print0(f"[Train] Global tokens/step: {global_tokens_per_update:,}")
-        print0(
-            f"[Optim] {job_config.optimizer.name} | "
-            f"impl={job_config.optimizer.implementation}"
-        )
+        for optim_line in format_optimizer_log(config, job_config):
+            print0(optim_line)
         print0(
             f"[LR] warmup={job_config.lr_scheduler.warmup_steps} | "
             f"decay={job_config.lr_scheduler.decay_type} | "
@@ -979,15 +1323,22 @@ def train(config: dict):
             f"{global_tokens_per_update * config['max_steps'] / 1e9:.1f}B tokens "
             f"over {config['max_steps']:,} optimizer steps"
         )
+        if start_step > 0:
+            print0(
+                f"[Resume] Starting at step {start_step} — dataset restarts from "
+                f"beginning (~{start_step * global_tokens_per_update / 1e9:.2f}B "
+                f"tokens of potential overlap with original run)"
+            )
 
         train_iter = iter(train_loader)
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
         train_pbar = progress_bar(
-            range(1, config["max_steps"] + 1),
+            range(start_step + 1, config["max_steps"] + 1),
             desc="train",
             total=config["max_steps"],
+            initial=start_step,
             position=0,
         )
         for step in train_pbar:
@@ -1005,7 +1356,12 @@ def train(config: dict):
 
                 with get_autocast_context(device):
                     normalized_loss, token_count = forward_loss(
-                        model, loss_fn, batch["input_ids"], device, use_flce
+                        model,
+                        loss_fn,
+                        batch["input_ids"],
+                        device,
+                        use_flce,
+                        attention_forward_kwargs,
                     )
                     loss = normalized_loss / config["grad_accum_steps"]
 
@@ -1013,8 +1369,11 @@ def train(config: dict):
                 accum_loss_sum += normalized_loss.detach().item() * token_count
                 accum_tokens += token_count
 
+            grad_norm = None
             if config["grad_clip"] is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config["grad_clip"]
+                ).item()
 
             optimizer.step()
             scheduler.step()
@@ -1025,8 +1384,14 @@ def train(config: dict):
             mean_loss = global_loss_sum / max(global_tokens, 1.0)
             ppl = math.exp(min(mean_loss, 20.0))
             lr = scheduler.get_last_lr()[0]
+            aux_lr = (
+                scheduler._adam.get_last_lr()[0]
+                if isinstance(scheduler, _DualLRScheduler)
+                else None
+            )
             elapsed = time.time() - step_start
             tok_s = global_tokens / max(elapsed, 1e-6)
+            tokens_seen = step * global_tokens_per_update
             train_pbar.set_postfix(
                 loss=f"{mean_loss:.4f}",
                 ppl=f"{ppl:.2f}",
@@ -1038,21 +1403,39 @@ def train(config: dict):
                 print0(
                     f"[Step {step:05d}] loss={mean_loss:.4f} | ppl={ppl:.2f} | "
                     f"lr={lr:.3e} | tok/s={tok_s:,.0f}"
+                    + (f" | gnorm={grad_norm:.3f}" if grad_norm is not None else "")
                 )
                 if tracker_run is not None:
-                    tracker_run.log(
-                        {
-                            "train/loss": mean_loss,
-                            "train/ppl": ppl,
-                            "train/lr": lr,
-                            "train/tokens_per_sec": tok_s,
-                            "step": step,
-                        },
-                        step=step,
-                    )
+                    log_dict = {
+                        "train/loss": mean_loss,
+                        "train/ppl": ppl,
+                        "train/lr": lr,
+                        "train/tokens_per_sec": tok_s,
+                        "train/tokens_seen": tokens_seen,
+                        "step": step,
+                    }
+                    if grad_norm is not None:
+                        log_dict["train/grad_norm"] = grad_norm
+                    if aux_lr is not None:
+                        log_dict["train/aux_lr"] = aux_lr
+                    if device.type == "cuda":
+                        log_dict["sys/gpu_mem_alloc_gb"] = (
+                            torch.cuda.memory_allocated(device) / 1e9
+                        )
+                        log_dict["sys/gpu_mem_reserved_gb"] = (
+                            torch.cuda.memory_reserved(device) / 1e9
+                        )
+                    tracker_run.log(log_dict, step=step)
 
             if step % config["eval_every_steps"] == 0:
-                metrics = evaluate(model, eval_loader, loss_fn, device, use_flce)
+                metrics = evaluate(
+                    model,
+                    eval_loader,
+                    loss_fn,
+                    device,
+                    use_flce,
+                    attention_forward_kwargs,
+                )
                 print0(
                     f"[Eval  {step:05d}] loss={metrics['eval_loss']:.4f} | "
                     f"ppl={metrics['eval_ppl']:.2f}"
@@ -1066,6 +1449,18 @@ def train(config: dict):
                         },
                         step=step,
                     )
+
+                if config.get("eval_benchmarks"):
+                    bench = run_lm_benchmarks(model, hf_assets_dir, device)
+                    if bench:
+                        for task in ("hellaswag", "winogrande"):
+                            acc = bench.get(f"bench/{task}/acc_norm,none") or bench.get(
+                                f"bench/{task}/acc,none"
+                            )
+                            if acc is not None:
+                                print0(f"[Bench {step:05d}] {task}: {acc:.4f}")
+                        if tracker_run is not None:
+                            tracker_run.log({**bench, "step": step}, step=step)
 
             if step % config["save_every_steps"] == 0:
                 save_checkpoint(model, optimizer, scheduler, step, config)

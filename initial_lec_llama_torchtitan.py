@@ -38,7 +38,7 @@ CONFIG = {
     "num_attention_heads": 16,
     "num_key_value_heads": 8,
     "intermediate_size": 8192,
-    "vocab_size": 128256,
+    "vocab_size": 32000,
     "max_position_embeddings": 2048,
     "rope_theta": 10000.0,
     "rms_norm_eps": 1e-6,
@@ -47,7 +47,7 @@ CONFIG = {
     "attention_bias": False,
     "hidden_act": "silu",
     "attn_implementation": "flash_attention_2",
-    "tokenizer_name": "meta-llama/Llama-3.2-1B",
+    "tokenizer_name": "meta-llama/Llama-2-7b",
     "hf_assets_dir": "./hf_assets_llama_lec_titan",
     # --- LEC ---
     "num_experts": 4,
@@ -66,13 +66,25 @@ CONFIG = {
         "fused_linear_cross_entropy": False,
     },
     # --- Training ---
+    "optimizer_name": "muon",
     "learning_rate": 3e-4,
     "min_lr_ratio": 0.1,
+    "min_lr_factor": 0.1,
     "weight_decay": 0.1,
     "beta1": 0.9,
     "beta2": 0.95,
     "optimizer_eps": 1e-8,
-    "optimizer_implementation": None,
+    "optimizer_implementation": "fused",
+    "muon_lr": 0.02,
+    "muon_momentum": 0.95,
+    "muon_nesterov": True,
+    "muon_ns_steps": 5,
+    "muon_weight_decay": 0.1,
+    "aux_adam_lr": 3e-4,
+    "aux_adam_beta1": 0.9,
+    "aux_adam_beta2": 0.95,
+    "aux_adam_eps": 1e-8,
+    "aux_adam_weight_decay": 0.1,
     "grad_clip": 1.0,
     "warmup_steps": 25,
     "lr_decay_type": "cosine",
@@ -92,6 +104,7 @@ CONFIG = {
     "log_every_steps": 1,
     # --- Misc ---
     "seed": 42,
+    "resume_from_checkpoint": None,
     "output_dir": "./checkpoints_llama_lec_torchtitan",
     "use_wandb": False,
     "wandb_project": "llama-lec-pretrain",
@@ -123,6 +136,13 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
+if hasattr(torch.optim, "Muon"):
+    MUON_IMPORT_ERROR = None
+else:
+    MUON_IMPORT_ERROR = ImportError(
+        "torch.optim.Muon not available - requires PyTorch >= 2.11"
+    )
 
 try:
     from liger_kernel.transformers import apply_liger_kernel_to_llama
@@ -164,6 +184,53 @@ def require_torchtitan():
         )
 
 
+def require_muon():
+    if MUON_IMPORT_ERROR is not None:
+        raise ImportError(
+            "Muon requires PyTorch >= 2.11 (torch.optim.Muon).\n"
+            f"Original error: {MUON_IMPORT_ERROR}"
+        ) from MUON_IMPORT_ERROR
+
+
+def resolve_optimizer_name(config: dict) -> str:
+    name = str(config.get("optimizer_name", "adamw")).strip().lower()
+    if name in {"adamw", "adam"}:
+        return "adamw"
+    if name == "muon":
+        return "muon"
+    raise NotImplementedError(f"Unsupported optimizer: {config.get('optimizer_name')}")
+
+
+def is_no_decay_param(name: str, param: torch.nn.Parameter) -> bool:
+    return param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower()
+
+
+def is_muon_hidden_param(name: str, param: torch.nn.Parameter) -> bool:
+    return name.startswith("model.layers.") and param.ndim >= 2
+
+
+def format_optimizer_log(config: dict, job_config: JobConfig) -> list[str]:
+    optimizer_name = resolve_optimizer_name(config)
+    if optimizer_name == "muon":
+        return [
+            "[Optim] Muon(hidden) + AuxAdam(non-hidden)",
+            (
+                "[Optim] "
+                f"muon_lr={config.get('muon_lr', 0.02):.3e} | "
+                f"muon_momentum={config.get('muon_momentum', 0.95):.2f} | "
+                f"muon_wd={config.get('muon_weight_decay', config['weight_decay']):.3e} | "
+                f"aux_lr={config.get('aux_adam_lr', config['learning_rate']):.3e} | "
+                f"aux_betas=({config.get('aux_adam_beta1', config['beta1']):.2f}, "
+                f"{config.get('aux_adam_beta2', config['beta2']):.2f}) | "
+                f"aux_eps={config.get('aux_adam_eps', config['optimizer_eps']):.1e}"
+            ),
+        ]
+    return [
+        f"[Optim] {job_config.optimizer.name} | "
+        f"impl={job_config.optimizer.implementation}"
+    ]
+
+
 def maybe_enable_liger_kernel(config: dict):
     if not config.get("use_liger_kernel", False):
         return
@@ -177,15 +244,32 @@ def maybe_enable_liger_kernel(config: dict):
         ) from LIGER_IMPORT_ERROR
 
     liger_cfg = dict(config.get("liger_kernel_config", {}))
-    if liger_cfg.get("cross_entropy") or liger_cfg.get("fused_linear_cross_entropy"):
+    if liger_cfg.get("cross_entropy") and liger_cfg.get("fused_linear_cross_entropy"):
         raise ValueError(
-            "This script computes loss outside the HF model with TorchTitan's "
-            "CrossEntropyLoss, so Liger's cross-entropy kernels are not wired in. "
-            "Keep 'cross_entropy' and 'fused_linear_cross_entropy' set to False, "
-            "or rewrite the loss path to use Liger's fused loss explicitly."
+            "Liger 'cross_entropy' and 'fused_linear_cross_entropy' are mutually "
+            "exclusive."
+        )
+    if liger_cfg.get("cross_entropy"):
+        raise ValueError(
+            "Liger 'cross_entropy' is not wired into this LEC script. "
+            "Use 'fused_linear_cross_entropy' instead."
         )
     apply_liger_kernel_to_llama(**liger_cfg)
     print0(f"[Liger] Enabled with config: {liger_cfg}")
+
+
+def resolve_attention_forward_kwargs(config: dict) -> dict:
+    kwargs = dict(config.get("attention_forward_kwargs", {}))
+    uses_gqa = config["num_attention_heads"] != config["num_key_value_heads"]
+
+    if (
+        config["attn_implementation"] == "flash_attention_4"
+        and uses_gqa
+        and "pack_gqa" not in kwargs
+    ):
+        kwargs["pack_gqa"] = False
+
+    return kwargs
 
 
 def is_dist_available_and_initialized() -> bool:
@@ -727,23 +811,11 @@ def build_torchtitan_ce_loss():
     )
 
 
-def build_model(config: dict) -> LlamaLEC:
+def build_model(config: dict, hf_assets_dir: Path) -> LlamaLEC:
     maybe_enable_liger_kernel(config)
-
-    llama_cfg = LlamaConfig(
-        hidden_size=config["hidden_size"],
-        num_hidden_layers=config["num_hidden_layers"],
-        num_attention_heads=config["num_attention_heads"],
-        num_key_value_heads=config["num_key_value_heads"],
-        intermediate_size=config["intermediate_size"],
-        vocab_size=config["vocab_size"],
-        max_position_embeddings=config["max_position_embeddings"],
-        rope_theta=config["rope_theta"],
-        rms_norm_eps=config["rms_norm_eps"],
-        initializer_range=config["initializer_range"],
-        tie_word_embeddings=config["tie_word_embeddings"],
-        attention_bias=config["attention_bias"],
-        hidden_act=config["hidden_act"],
+    llama_cfg = LlamaConfig.from_pretrained(hf_assets_dir)
+    llama_cfg.max_position_embeddings = max(
+        llama_cfg.max_position_embeddings, config["max_seq_len"]
     )
     lec_config = {
         key: config[key]
@@ -756,10 +828,16 @@ def build_model(config: dict) -> LlamaLEC:
         ]
     }
 
+    model_kwargs = {
+        "lec_config": lec_config,
+        "attn_implementation": config["attn_implementation"],
+    }
+    if use_bf16():
+        model_kwargs["dtype"] = torch.bfloat16
+
     model = LlamaLEC._from_config(
         llama_cfg,
-        lec_config=lec_config,
-        attn_implementation=config["attn_implementation"],
+        **model_kwargs,
     )
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -877,18 +955,30 @@ def build_dataloader(
 
 def build_torchtitan_job_config(config: dict, world_size: int) -> JobConfig:
     require_torchtitan()
+    optimizer_name = resolve_optimizer_name(config)
 
     job_config = JobConfig()
     job_config.job.dump_folder = str(Path(config["output_dir"]).resolve())
-    job_config.optimizer.name = "AdamW"
-    job_config.optimizer.lr = config["learning_rate"]
+    job_config.optimizer.name = "Muon" if optimizer_name == "muon" else "AdamW"
+    job_config.optimizer.lr = (
+        config.get("muon_lr", 0.02)
+        if optimizer_name == "muon"
+        else config["learning_rate"]
+    )
     job_config.optimizer.beta1 = config["beta1"]
     job_config.optimizer.beta2 = config["beta2"]
     job_config.optimizer.eps = config["optimizer_eps"]
-    job_config.optimizer.weight_decay = config["weight_decay"]
-    job_config.optimizer.implementation = config.get("optimizer_implementation") or (
-        "fused" if torch.cuda.is_available() else "for-loop"
+    job_config.optimizer.weight_decay = (
+        config.get("muon_weight_decay", config["weight_decay"])
+        if optimizer_name == "muon"
+        else config["weight_decay"]
     )
+    if optimizer_name == "muon":
+        job_config.optimizer.implementation = "muon"
+    else:
+        job_config.optimizer.implementation = config.get(
+            "optimizer_implementation"
+        ) or ("fused" if torch.cuda.is_available() else "for-loop")
     job_config.lr_scheduler.warmup_steps = config["warmup_steps"]
     job_config.lr_scheduler.decay_ratio = config.get("lr_decay_ratio")
     job_config.lr_scheduler.decay_type = config.get("lr_decay_type", "cosine")
@@ -906,14 +996,105 @@ def build_torchtitan_job_config(config: dict, world_size: int) -> JobConfig:
     return job_config
 
 
-def build_optimizer(model: torch.nn.Module, job_config: JobConfig) -> AdamW:
+class _NativeMuonWithAuxAdam:
+    def __init__(self, muon, adam: AdamW):
+        self._muon = muon
+        self._adam = adam
+        self.param_groups = muon.param_groups + adam.param_groups
+
+    def step(self, closure=None):
+        self._muon.step(closure)
+        self._adam.step(closure)
+
+    def zero_grad(self, set_to_none: bool = True):
+        self._muon.zero_grad(set_to_none=set_to_none)
+        self._adam.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {"muon": self._muon.state_dict(), "adam": self._adam.state_dict()}
+
+    def load_state_dict(self, state_dict: dict):
+        self._muon.load_state_dict(state_dict["muon"])
+        self._adam.load_state_dict(state_dict["adam"])
+
+
+class _DualLRScheduler:
+    def __init__(self, sched_muon: LambdaLR, sched_adam: LambdaLR):
+        self._muon = sched_muon
+        self._adam = sched_adam
+
+    def step(self):
+        self._muon.step()
+        self._adam.step()
+
+    def get_last_lr(self) -> list:
+        return self._muon.get_last_lr()
+
+    def state_dict(self) -> dict:
+        return {"muon": self._muon.state_dict(), "adam": self._adam.state_dict()}
+
+    def load_state_dict(self, state_dict: dict):
+        self._muon.load_state_dict(state_dict["muon"])
+        self._adam.load_state_dict(state_dict["adam"])
+
+
+def build_optimizer(
+    model: torch.nn.Module, job_config: JobConfig, config: dict
+) -> torch.optim.Optimizer:
+    optimizer_name = resolve_optimizer_name(config)
+    base_model = unwrap_model(model)
+
+    if optimizer_name == "muon":
+        require_muon()
+        muon_params = []
+        aux_decay_params = []
+        aux_no_decay_params = []
+        for name, param in base_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if is_muon_hidden_param(name, param):
+                muon_params.append(param)
+            elif is_no_decay_param(name, param):
+                aux_no_decay_params.append(param)
+            else:
+                aux_decay_params.append(param)
+        if not muon_params:
+            raise RuntimeError("Muon partitioning found no hidden matrix parameters.")
+
+        muon_opt = torch.optim.Muon(
+            muon_params,
+            lr=config.get("muon_lr", 0.02),
+            momentum=config.get("muon_momentum", 0.95),
+            nesterov=config.get("muon_nesterov", True),
+            weight_decay=config.get("muon_weight_decay", config["weight_decay"]),
+            ns_steps=config.get("muon_ns_steps", 5),
+        )
+        adam_opt = AdamW(
+            [
+                {
+                    "params": aux_decay_params,
+                    "weight_decay": config.get(
+                        "aux_adam_weight_decay", config["weight_decay"]
+                    ),
+                },
+                {"params": aux_no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=config.get("aux_adam_lr", config["learning_rate"]),
+            betas=(
+                config.get("aux_adam_beta1", config["beta1"]),
+                config.get("aux_adam_beta2", config["beta2"]),
+            ),
+            eps=config.get("aux_adam_eps", config["optimizer_eps"]),
+        )
+        return _NativeMuonWithAuxAdam(muon_opt, adam_opt)
+
     decay_params = []
     no_decay_params = []
 
-    for name, param in model.named_parameters():
+    for name, param in base_model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower():
+        if is_no_decay_param(name, param):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -955,7 +1136,9 @@ def build_optimizer(model: torch.nn.Module, job_config: JobConfig) -> AdamW:
     )
 
 
-def build_scheduler(optimizer: AdamW, job_config: JobConfig) -> LambdaLR:
+def build_scheduler(
+    optimizer: torch.optim.Optimizer, job_config: JobConfig
+) -> LambdaLR:
     warmup_steps = job_config.lr_scheduler.warmup_steps
     max_steps = job_config.training.steps
     decay_ratio = job_config.lr_scheduler.decay_ratio
@@ -986,6 +1169,11 @@ def build_scheduler(optimizer: AdamW, job_config: JobConfig) -> LambdaLR:
             )
         return min_lr_factor + (1.0 - min_lr_factor) * decay
 
+    if isinstance(optimizer, _NativeMuonWithAuxAdam):
+        return _DualLRScheduler(
+            LambdaLR(optimizer._muon, lr_lambda=lr_lambda),
+            LambdaLR(optimizer._adam, lr_lambda=lr_lambda),
+        )
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
@@ -1002,7 +1190,7 @@ def flush_router_load_balance(model: torch.nn.Module):
 
 def save_checkpoint(
     model: torch.nn.Module,
-    optimizer: AdamW,
+    optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     step: int,
     config: dict,
@@ -1027,6 +1215,20 @@ def save_checkpoint(
     print0(f"[Checkpoint] Saved {path}")
 
 
+def load_checkpoint(config: dict, hf_assets_dir: Path):
+    ckpt_path = Path(config["resume_from_checkpoint"]).resolve()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+
+    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = build_model(config, hf_assets_dir)
+    model.load_state_dict(saved["model"])
+    start_step = int(saved.get("step", 0))
+    print0(f"[Resume] Loaded checkpoint {ckpt_path}")
+    print0(f"[Resume] Resuming from step {start_step}")
+    return model, start_step, saved.get("optimizer"), saved.get("scheduler")
+
+
 # =============================================================================
 # TRAIN / EVAL
 # =============================================================================
@@ -1037,32 +1239,48 @@ def forward_loss(
     loss_fn,
     input_ids: torch.Tensor,
     device: torch.device,
+    use_flce: bool,
+    attention_forward_kwargs: Optional[dict] = None,
     collect_lec_metrics: bool = False,
 ) -> tuple[torch.Tensor, int, dict]:
     input_ids = input_ids.to(device, non_blocking=True)
     unwrapped = unwrap_model(model)
+    model_kwargs = dict(attention_forward_kwargs or {})
 
     if hasattr(unwrapped, "log_lec_metrics"):
         unwrapped.log_lec_metrics = collect_lec_metrics
 
     try:
-        outputs = model(input_ids=input_ids)
+        if use_flce:
+            outputs = model(input_ids=input_ids, labels=input_ids, **model_kwargs)
+        else:
+            outputs = model(input_ids=input_ids, **model_kwargs)
     finally:
         if hasattr(unwrapped, "log_lec_metrics"):
             unwrapped.log_lec_metrics = False
 
+    local_tokens = input_ids.shape[0] * (input_ids.shape[1] - 1)
+    if use_flce:
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        return loss, local_tokens, getattr(outputs, "lec_metrics", {})
+
     logits = outputs.logits
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
-
-    local_tokens = shift_labels.numel()
     local_tokens_tensor = torch.tensor(local_tokens, device=device, dtype=torch.float32)
     loss = loss_fn(shift_logits, shift_labels, local_tokens_tensor)
     return loss, local_tokens, getattr(outputs, "lec_metrics", {})
 
 
 @torch.no_grad()
-def evaluate(model, eval_loader: DataLoader, loss_fn, device: torch.device) -> dict:
+def evaluate(
+    model,
+    eval_loader: DataLoader,
+    loss_fn,
+    device: torch.device,
+    use_flce: bool,
+    attention_forward_kwargs: Optional[dict] = None,
+) -> dict:
     model.eval()
     total_loss_sum = 0.0
     total_tokens = 0.0
@@ -1070,13 +1288,16 @@ def evaluate(model, eval_loader: DataLoader, loss_fn, device: torch.device) -> d
     eval_pbar = progress_bar(eval_loader, desc="eval", position=1)
     try:
         for batch in eval_pbar:
-            loss, token_count, _ = forward_loss(
-                model,
-                loss_fn,
-                batch["input_ids"],
-                device,
-                collect_lec_metrics=False,
-            )
+            with get_autocast_context(device):
+                loss, token_count, _ = forward_loss(
+                    model,
+                    loss_fn,
+                    batch["input_ids"],
+                    device,
+                    use_flce,
+                    attention_forward_kwargs,
+                    collect_lec_metrics=False,
+                )
             total_loss_sum += loss.item() * token_count
             total_tokens += token_count
     finally:
@@ -1113,14 +1334,23 @@ def train(config: dict):
             tokenizer_size = load_tokenizer_size_from_assets(hf_assets_dir)
 
         tokenizer = build_torchtitan_tokenizer(hf_assets_dir)
-        model = build_model(config)
+        resume_ckpt = config.get("resume_from_checkpoint")
+        if resume_ckpt:
+            model, start_step, opt_state, sched_state = load_checkpoint(
+                config, hf_assets_dir
+            )
+        else:
+            model = build_model(config, hf_assets_dir)
+            start_step = 0
+            opt_state = None
+            sched_state = None
         model.to(device)
 
         if tokenizer_size != model.config.vocab_size:
-            print0(
-                f"[Warning] Resizing embeddings: {model.config.vocab_size} -> {tokenizer_size}"
+            raise ValueError(
+                f"Tokenizer/model vocab mismatch: tokenizer={tokenizer_size}, "
+                f"model={model.config.vocab_size}. Regenerate assets/config before training."
             )
-            model.resize_token_embeddings(tokenizer_size)
 
         if config["torch_compile"]:
             print0(f"[Compile] torch.compile enabled ({config['torch_compile_mode']})")
@@ -1158,9 +1388,21 @@ def train(config: dict):
         eval_loader = build_dataloader(eval_ds, config["per_device_batch_size"], config)
 
         job_config = build_torchtitan_job_config(config, get_world_size())
-        optimizer = build_optimizer(model, job_config)
+        optimizer = build_optimizer(model, job_config, config)
         scheduler = build_scheduler(optimizer, job_config)
-        loss_fn = build_torchtitan_ce_loss()
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+            print0("[Resume] Optimizer state restored.")
+        if sched_state is not None:
+            scheduler.load_state_dict(sched_state)
+            print0("[Resume] Scheduler state restored.")
+        attention_forward_kwargs = resolve_attention_forward_kwargs(config)
+        if attention_forward_kwargs:
+            print0(f"[Attention] Forward kwargs: {attention_forward_kwargs}")
+        use_flce = bool(
+            config.get("liger_kernel_config", {}).get("fused_linear_cross_entropy")
+        )
+        loss_fn = None if use_flce else build_torchtitan_ce_loss()
 
         local_tokens_per_update = (
             config["per_device_batch_size"]
@@ -1170,9 +1412,8 @@ def train(config: dict):
         global_tokens_per_update = local_tokens_per_update * get_world_size()
         print0(f"[Train] Local tokens/step: {local_tokens_per_update:,}")
         print0(f"[Train] Global tokens/step: {global_tokens_per_update:,}")
-        print0(
-            f"[Optim] {job_config.optimizer.name} | impl={job_config.optimizer.implementation}"
-        )
+        for optim_line in format_optimizer_log(config, job_config):
+            print0(optim_line)
         print0(
             f"[LR] warmup={job_config.lr_scheduler.warmup_steps} | "
             f"decay={job_config.lr_scheduler.decay_type} | "
@@ -1183,15 +1424,20 @@ def train(config: dict):
             f"[Train] Total: {global_tokens_per_update * config['max_steps'] / 1e9:.1f}B "
             f"tokens over {config['max_steps']:,} optimizer steps"
         )
+        if use_flce:
+            print0("[Loss] Liger fused_linear_cross_entropy ON")
+        else:
+            print0("[Loss] TorchTitan cross_entropy_loss")
 
         train_iter = iter(train_loader)
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
         train_pbar = progress_bar(
-            range(1, config["max_steps"] + 1),
+            range(start_step + 1, config["max_steps"] + 1),
             desc="train",
             total=config["max_steps"],
+            initial=start_step,
             position=0,
         )
         for step in train_pbar:
@@ -1219,6 +1465,8 @@ def train(config: dict):
                         loss_fn,
                         batch["input_ids"],
                         device,
+                        use_flce,
+                        attention_forward_kwargs,
                         collect_lec_metrics=log_lec_this_step,
                     )
                     loss = normalized_loss / config["grad_accum_steps"]
@@ -1232,8 +1480,11 @@ def train(config: dict):
                         metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
                     metric_count += 1
 
+            grad_norm = None
             if config["grad_clip"] is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config["grad_clip"]
+                ).item()
 
             flush_router_load_balance(model)
             optimizer.step()
@@ -1245,8 +1496,14 @@ def train(config: dict):
             mean_loss = global_loss_sum / max(global_tokens, 1.0)
             ppl = math.exp(min(mean_loss, 20.0))
             lr = scheduler.get_last_lr()[0]
+            aux_lr = (
+                scheduler._adam.get_last_lr()[0]
+                if isinstance(scheduler, _DualLRScheduler)
+                else None
+            )
             elapsed = time.time() - step_start
             tok_s = global_tokens / max(elapsed, 1e-6)
+            tokens_seen = step * global_tokens_per_update
             reduced_lec_metrics = reduce_mean_metrics(metric_sums, metric_count, device)
             postfix = {
                 "loss": f"{mean_loss:.4f}",
@@ -1262,6 +1519,7 @@ def train(config: dict):
                 log_line = (
                     f"[Step {step:05d}] loss={mean_loss:.4f} | ppl={ppl:.2f} | "
                     f"lr={lr:.3e} | tok/s={tok_s:,.0f}"
+                    + (f" | gnorm={grad_norm:.3f}" if grad_norm is not None else "")
                 )
                 if reduced_lec_metrics:
                     if "router_entropy" in reduced_lec_metrics:
@@ -1279,14 +1537,33 @@ def train(config: dict):
                         "train/ppl": ppl,
                         "train/lr": lr,
                         "train/tokens_per_sec": tok_s,
+                        "train/tokens_seen": tokens_seen,
                         "step": step,
                     }
+                    if grad_norm is not None:
+                        payload["train/grad_norm"] = grad_norm
+                    if aux_lr is not None:
+                        payload["train/aux_lr"] = aux_lr
+                    if device.type == "cuda":
+                        payload["sys/gpu_mem_alloc_gb"] = (
+                            torch.cuda.memory_allocated(device) / 1e9
+                        )
+                        payload["sys/gpu_mem_reserved_gb"] = (
+                            torch.cuda.memory_reserved(device) / 1e9
+                        )
                     for key, value in reduced_lec_metrics.items():
                         payload[f"lec/{key}"] = value
                     wandb_run.log(payload, step=step)
 
             if step % config["eval_every_steps"] == 0:
-                metrics = evaluate(model, eval_loader, loss_fn, device)
+                metrics = evaluate(
+                    model,
+                    eval_loader,
+                    loss_fn,
+                    device,
+                    use_flce,
+                    attention_forward_kwargs,
+                )
                 print0(
                     f"[Eval {step:05d}] loss={metrics['eval_loss']:.4f} | "
                     f"ppl={metrics['eval_ppl']:.2f}"

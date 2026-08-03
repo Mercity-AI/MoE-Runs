@@ -1,7 +1,7 @@
 # Core training / eval dependencies
-torch
-transformers
-datasets
+torch==2.11.0
+transformers==5.8.0
+datasets==4.8.5
 accelerate
 wandb
 trackio
@@ -10,11 +10,19 @@ sentencepiece
 protobuf
 lm-eval
 tqdm
+pypdf
+certifi
 
 # TorchTitan-backed scripts
-torchtitan
+torchtitan==0.2.2
+
+# Optional data collection helpers
+yt-dlp
+youtube-transcript-api
 
 # Optional CUDA accelerators
 # Install these only in a compatible Linux/CUDA environment.
-flash-attn
-# liger-kernel
+# Blackwell/Hopper training stack used by the TorchTitan scripts. Install the
+# CUDA-matched flash-attn-4 extra as documented in setup.sh.
+flash-attn-4==4.0.0b12
+liger-kernel==0.8.0

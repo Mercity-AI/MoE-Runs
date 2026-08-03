@@ -1,13 +1,11 @@
-"""Train the dense 1B LLaMA baseline on packed FineWeb with TorchTitan helpers."""
+"""Train the 1B LLaMA + LongCat input N-gram Embedding ablation."""
 
 import math
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
-from torch.nn.parallel import DistributedDataParallel
 
 from data import PackedFineWebDataset, build_dataloader
 from utils import (
@@ -15,10 +13,8 @@ from utils import (
     build_torchtitan_ce_loss,
     build_torchtitan_tokenizer,
     ensure_hf_assets,
-    load_tokenizer_size,
     require_torchtitan,
     DualLRScheduler,
-    barrier,
     build_job_config,
     build_optimizer,
     build_scheduler,
@@ -27,14 +23,10 @@ from utils import (
     format_optimizer_log,
     forward_loss,
     get_autocast_context,
-    get_rank,
-    get_world_size,
-    is_main_process,
     load_checkpoint,
     maybe_init_tracker,
     print0,
     progress_bar,
-    reduce_sum_scalar,
     resolve_attention_forward_kwargs,
     run_lm_benchmarks,
     save_checkpoint,
@@ -45,7 +37,7 @@ from utils import (
 
 CONFIG = {
     "hidden_size": 1536,
-    "num_hidden_layers": 32,
+    "num_hidden_layers": 15,
     "num_attention_heads": 12,
     "num_key_value_heads": 4,
     "intermediate_size": 5120,
@@ -59,7 +51,15 @@ CONFIG = {
     "hidden_act": "silu",
     "attn_implementation": "flash_attention_4",
     "tokenizer_name": "meta-llama/Llama-2-7b",
-    "hf_assets_dir": "./hf_assets_llama_1b_titan",
+    "hf_assets_dir": "./hf_assets_llama_1b_longcat_ngram_titan",
+    # LongCat NE: orders 2..4, two hash tables per order, LayerNorm amplification.
+    "ngram_max_n": 4,
+    "ngram_num_heads": 2,
+    "ngram_table_vocab_sizes": [322336] * 3 + [322335] * 3,
+    "ngram_embedding_amplification": "layer_norm",
+    # Per-head Q/K RMSNorm after projection and before RoPE (Qwen3/Gemma-style).
+    "qk_norm": True,
+    "qk_norm_eps": 1e-6,
     "use_liger_kernel": True,
     "liger_kernel_config": {
         "rope": True,
@@ -109,8 +109,8 @@ CONFIG = {
     "resume_from_checkpoint": None,
     "init_from_checkpoint": None,
     "allow_inexact_legacy_data_resume": False,
-    "output_dir": "./checkpoints_llama_1b_6b",
-    "use_wandb": True,
+    "output_dir": "./checkpoints_llama_1b_longcat_ngram_6b",
+    "use_wandb": False,
     "wandb_project": "llama-1b-6b-torchtitan",
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
@@ -121,21 +121,13 @@ CONFIG = {
 
 def train(config: dict):
     require_torchtitan()
-    device = setup_runtime(distributed=True)
+    device = setup_runtime(distributed=False)
     Path(config["output_dir"]).resolve().mkdir(parents=True, exist_ok=True)
     seed_everything(config["seed"])
-    tracker = maybe_init_tracker(config, "llama_baseline_torchtitan")
+    tracker = maybe_init_tracker(config, "llama_longcat_ngram_torchtitan")
 
     try:
-        if is_main_process():
-            assets_dir, tokenizer_size = ensure_hf_assets(config, "llama")
-        else:
-            assets_dir = Path(config["hf_assets_dir"]).resolve()
-            tokenizer_size = 0
-        barrier()
-        if not is_main_process():
-            tokenizer_size = load_tokenizer_size(assets_dir)
-
+        assets_dir, tokenizer_size = ensure_hf_assets(config, "longcat_ngram")
         tokenizer = build_torchtitan_tokenizer(assets_dir)
         resume_path = config.get("resume_from_checkpoint")
         init_path = config.get("init_from_checkpoint")
@@ -144,24 +136,18 @@ def train(config: dict):
         if resume_path or init_path:
             model, start_step, optimizer_state, scheduler_state = load_checkpoint(
                 config,
-                "llama",
+                "longcat_ngram",
                 checkpoint_path=resume_path or init_path,
                 resume_training=bool(resume_path),
             )
         else:
-            model = build_model(config, assets_dir, "llama")
+            model = build_model(config, assets_dir, "longcat_ngram")
             start_step, optimizer_state, scheduler_state = 0, None, None
         model.to(device)
         if tokenizer_size != model.config.vocab_size:
             raise ValueError("Tokenizer and model vocabulary sizes differ.")
         if config["torch_compile"]:
             model = torch.compile(model, mode=config["torch_compile_mode"])
-        if get_world_size() > 1:
-            model = DistributedDataParallel(
-                model,
-                device_ids=[device.index] if device.type == "cuda" else None,
-                output_device=device.index if device.type == "cuda" else None,
-            )
 
         raw_data = load_dataset(
             config["dataset_name"],
@@ -171,14 +157,13 @@ def train(config: dict):
         )
         if not config.get("cross_document_attention", True):
             raise NotImplementedError("Document-masked FA4 attention is not implemented.")
+        print0("[Packing] EOS resets n-grams; causal attention crosses packed documents.")
         train_data = PackedFineWebDataset(
             config,
             tokenizer,
             seed=config["seed"],
             start_batch=start_step * config["grad_accum_steps"],
             partition="train",
-            rank=get_rank(),
-            world_size=get_world_size(),
             base_dataset=raw_data,
         )
         eval_data = PackedFineWebDataset(
@@ -186,14 +171,12 @@ def train(config: dict):
             tokenizer,
             seed=config["seed"] + 9999,
             partition="eval",
-            rank=get_rank(),
-            world_size=get_world_size(),
             base_dataset=raw_data,
         )
         train_loader = build_dataloader(train_data, config["per_device_batch_size"], config)
         eval_loader = build_dataloader(eval_data, config["per_device_batch_size"], config)
 
-        job = build_job_config(config, get_world_size())
+        job = build_job_config(config)
         max_steps = job.training.steps
         if start_step > max_steps:
             raise ValueError(f"Checkpoint step {start_step} exceeds max_steps={max_steps}.")
@@ -211,7 +194,6 @@ def train(config: dict):
             config["per_device_batch_size"]
             * config["grad_accum_steps"]
             * (config["max_seq_len"] - 1)
-            * get_world_size()
         )
         print0(f"[Train] {max_steps:,} steps | {tokens_per_step * max_steps / 1e9:.3f}B tokens")
         for line in format_optimizer_log(config, job):
@@ -229,15 +211,13 @@ def train(config: dict):
         for step in bar:
             started = time.time()
             loss_sum, token_count = 0.0, 0
-            for micro_step in range(config["grad_accum_steps"]):
+            for _ in range(config["grad_accum_steps"]):
                 try:
                     batch = next(train_iter)
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                sync = micro_step == config["grad_accum_steps"] - 1
-                context = nullcontext() if sync or not isinstance(model, DistributedDataParallel) else model.no_sync()
-                with context, get_autocast_context(device):
+                with get_autocast_context(device):
                     micro_loss, micro_tokens = forward_loss(
                         model, loss_fn, batch["input_ids"], device, use_flce, attention_kwargs
                     )
@@ -249,16 +229,14 @@ def train(config: dict):
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            total_loss = reduce_sum_scalar(loss_sum, device)
-            total_tokens = reduce_sum_scalar(float(token_count), device)
-            mean_loss = total_loss / max(total_tokens, 1.0)
+            mean_loss = loss_sum / max(token_count, 1)
             lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - started
             metrics = {
                 "train/loss": mean_loss,
                 "train/ppl": math.exp(min(mean_loss, 20.0)),
                 "train/lr": lr,
-                "train/tokens_per_sec": total_tokens / max(elapsed, 1e-6),
+                "train/tokens_per_sec": token_count / max(elapsed, 1e-6),
                 "train/tokens_seen": step * tokens_per_step,
                 "train/grad_norm": grad_norm,
                 "step": step,
@@ -276,24 +254,22 @@ def train(config: dict):
                     loss_fn,
                     device,
                     use_flce,
-                    math.ceil(config["eval_max_examples"] / get_world_size()),
+                    config["eval_max_examples"],
                     attention_kwargs,
                 )
                 print0(f"[Eval {step}] loss={eval_metrics['eval_loss']:.4f}")
                 if tracker is not None:
                     tracker.log({f"eval/{k.removeprefix('eval_')}": v for k, v in eval_metrics.items()}, step=step)
                 if config["eval_benchmarks"]:
-                    barrier()
                     benchmarks = run_lm_benchmarks(model, assets_dir, device)
                     if tracker is not None and benchmarks:
                         tracker.log(benchmarks, step=step)
-                    barrier()
             if step % config["save_every_steps"] == 0:
                 save_checkpoint(model, optimizer, scheduler, step, config)
 
         bar.close()
         save_checkpoint(model, optimizer, scheduler, max_steps, config)
-        print0("[Train] Dense LLaMA pretraining complete.")
+        print0("[Train] LLaMA + LongCat n-gram pretraining complete.")
     finally:
         if tracker is not None:
             tracker.finish()

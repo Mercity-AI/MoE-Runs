@@ -49,6 +49,8 @@ class PackedFineWebDataset(IterableDataset):
         self.max_examples = max_examples
         self.start_batch = start_batch
         self.partition = partition
+        if partition == "eval":
+            self.buffer_size = config.get("eval_streaming_buffer_size", 1)
         self.holdout_fraction = config.get("eval_holdout_fraction", 0.005)
         self.rank = rank
         self.world_size = world_size

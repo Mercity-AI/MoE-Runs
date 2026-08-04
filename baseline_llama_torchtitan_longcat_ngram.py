@@ -1,6 +1,7 @@
 """Train the 1B LLaMA + LongCat input N-gram Embedding ablation."""
 
 import math
+import subprocess
 import time
 from pathlib import Path
 
@@ -37,9 +38,9 @@ from utils import (
 
 CONFIG = {
     "hidden_size": 1536,
-    "num_hidden_layers": 15,
+    "num_hidden_layers": 16,
     "num_attention_heads": 12,
-    "num_key_value_heads": 4,
+    "num_key_value_heads": 6,
     "intermediate_size": 5120,
     "vocab_size": 32000,
     "max_position_embeddings": 8192,
@@ -51,11 +52,11 @@ CONFIG = {
     "hidden_act": "silu",
     "attn_implementation": "flash_attention_4",
     "tokenizer_name": "meta-llama/Llama-2-7b",
-    "hf_assets_dir": "./hf_assets_llama_1b_longcat_ngram_titan",
+    "hf_assets_dir": "./hf_assets_llama_1b_longcat_ngram_titan_2307",
     # LongCat NE: orders 2..4, two hash tables per order, LayerNorm amplification.
     "ngram_max_n": 4,
     "ngram_num_heads": 2,
-    "ngram_table_vocab_sizes": [322336] * 3 + [322335] * 3,
+    "ngram_table_vocab_sizes": [267003, 367007, 305011, 341013, 345017, 308962],
     "ngram_embedding_amplification": "layer_norm",
     # Per-head Q/K RMSNorm after projection and before RoPE (Qwen3/Gemma-style).
     "qk_norm": True,
@@ -90,14 +91,15 @@ CONFIG = {
     "lr_decay_type": "cosine",
     "lr_decay_ratio": None,
     "min_lr_factor": 0.1,
-    "max_steps": 3_052,
-    "target_train_tokens": 6_000_000_000,
+    "max_steps": 3_053,
+    "target_train_tokens": None,
     "per_device_batch_size": 12,
     "grad_accum_steps": 20,
     "max_seq_len": 8192,
     "dataset_name": "HuggingFaceFW/fineweb",
     "dataset_config": "sample-10BT",
     "streaming_buffer_size": 10_000,
+    "eval_streaming_buffer_size": 1,
     "eval_max_examples": 512,
     "eval_holdout_fraction": 0.005,
     "cross_document_attention": True,
@@ -109,9 +111,13 @@ CONFIG = {
     "resume_from_checkpoint": None,
     "init_from_checkpoint": None,
     "allow_inexact_legacy_data_resume": False,
-    "output_dir": "./checkpoints_llama_1b_longcat_ngram_6b",
-    "use_wandb": False,
+    "output_dir": "./checkpoints_llama_1b_longcat_ngram_6b_2307",
+    "sync_checkpoints_to_bucket": True,
+    "checkpoint_bucket_folder": "checkpoints_llama_1b_longcat_ngram_6b_2307",
+    "use_wandb": True,
     "wandb_project": "llama-1b-6b-torchtitan",
+    "wandb_run_name": "llama-6b-1b-ngram-2307",
+    "wandb_log_console": False,
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
     "torch_compile": False,
@@ -124,7 +130,7 @@ def train(config: dict):
     device = setup_runtime(distributed=False)
     Path(config["output_dir"]).resolve().mkdir(parents=True, exist_ok=True)
     seed_everything(config["seed"])
-    tracker = maybe_init_tracker(config, "llama_longcat_ngram_torchtitan")
+    tracker = maybe_init_tracker(config, config["wandb_run_name"])
 
     try:
         assets_dir, tokenizer_size = ensure_hf_assets(config, "longcat_ngram")
@@ -170,6 +176,7 @@ def train(config: dict):
             config,
             tokenizer,
             seed=config["seed"] + 9999,
+            max_examples=config["eval_max_examples"],
             partition="eval",
             base_dataset=raw_data,
         )
@@ -268,8 +275,20 @@ def train(config: dict):
                 save_checkpoint(model, optimizer, scheduler, step, config)
 
         bar.close()
-        save_checkpoint(model, optimizer, scheduler, max_steps, config)
+        if max_steps % config["save_every_steps"] != 0:
+            save_checkpoint(model, optimizer, scheduler, max_steps, config)
         print0("[Train] LLaMA + LongCat n-gram pretraining complete.")
+        if config.get("sync_checkpoints_to_bucket", False):
+            sync_script = Path(__file__).resolve().with_name("sync_checkpoint_bucket.sh")
+            subprocess.run(
+                [
+                    str(sync_script),
+                    str(Path(config["output_dir"]).resolve()),
+                    config.get("checkpoint_bucket_folder")
+                    or Path(config["output_dir"]).resolve().name,
+                ],
+                check=True,
+            )
     finally:
         if tracker is not None:
             tracker.finish()

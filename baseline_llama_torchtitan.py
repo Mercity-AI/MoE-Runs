@@ -47,7 +47,7 @@ CONFIG = {
     "hidden_size": 1536,
     "num_hidden_layers": 32,
     "num_attention_heads": 12,
-    "num_key_value_heads": 4,
+    "num_key_value_heads": 6,
     "intermediate_size": 5120,
     "vocab_size": 32000,
     "max_position_embeddings": 8192,

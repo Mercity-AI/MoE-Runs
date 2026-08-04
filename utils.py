@@ -310,7 +310,14 @@ def maybe_init_tracker(config: dict, run_name: str):
     """Initialize W&B; the complete runtime config is recorded once."""
     if not config["use_wandb"] or not is_main_process():
         return None
-    return wandb.init(project=config["wandb_project"], name=run_name, config=config)
+    return wandb.init(
+        project=config["wandb_project"],
+        name=run_name,
+        config=config,
+        settings=wandb.Settings(
+            console="auto" if config.get("wandb_log_console", False) else "off"
+        ),
+    )
 
 
 def run_lm_benchmarks(
@@ -436,7 +443,17 @@ class DualLRScheduler:
 
 
 def _is_no_decay(name: str, param: torch.nn.Parameter) -> bool:
-    return param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower()
+    # N-gram hash tables are 2-D embeddings with sparse gradients: uniform decay
+    # would erode rare high-order rows between their infrequent updates. Exempt
+    # them by name (shape can't distinguish a lookup table from a dense linear).
+    # Projections stay decayed (real dense linears); embed_tokens is left decayed
+    # deliberately (tied to the LM head, per common practice).
+    return (
+        param.ndim == 1
+        or name.endswith(".bias")
+        or "norm" in name.lower()
+        or ".tables." in name
+    )
 
 
 def build_optimizer(model: torch.nn.Module, job, config: dict):
@@ -558,7 +575,9 @@ def save_checkpoint(model, optimizer, scheduler, step: int, config: dict):
     root.mkdir(parents=True, exist_ok=True)
     hf_dir = root / f"step_{step:06d}_hf"
     unwrap_model(model).save_pretrained(hf_dir, safe_serialization=True)
-    AutoTokenizer.from_pretrained(Path(config["hf_assets_dir"]).resolve()).save_pretrained(hf_dir)
+    AutoTokenizer.from_pretrained(
+        Path(config["hf_assets_dir"]).resolve(), trust_remote_code=True
+    ).save_pretrained(hf_dir)
     (hf_dir / "training_config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

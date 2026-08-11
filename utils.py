@@ -19,7 +19,13 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 from transformers.modeling_utils import PreTrainedModel
 
-from model import LlamaLongCatNgram, LlamaLongCatNgramConfig
+from model import (
+    LlamaKDA,
+    LlamaKDAConfig,
+    LlamaLongCatNgram,
+    LlamaLongCatNgramConfig,
+    resolve_kda_layer_types,
+)
 
 try:
     from liger_kernel.transformers import apply_liger_kernel_to_llama
@@ -79,6 +85,8 @@ def _patch_initialize_weights_compat():
 def _architecture_types(architecture: str):
     if architecture == "longcat_ngram":
         return LlamaLongCatNgramConfig, LlamaLongCatNgram
+    if architecture == "kda":
+        return LlamaKDAConfig, LlamaKDA
     if architecture == "llama":
         return LlamaConfig, LlamaForCausalLM
     raise ValueError(f"Unknown architecture: {architecture!r}")
@@ -110,6 +118,33 @@ def build_model_config(config: dict, tokenizer, architecture: str):
             ngram_num_heads=config["ngram_num_heads"],
             ngram_table_vocab_sizes=config["ngram_table_vocab_sizes"],
             ngram_embedding_amplification=config["ngram_embedding_amplification"],
+            ngram_hash_multipliers=config.get("ngram_hash_multipliers"),
+            ngram_min_pairwise_size_gap=config.get(
+                "ngram_min_pairwise_size_gap", 0.005
+            ),
+            qk_norm=config.get("qk_norm", False),
+            qk_norm_eps=config.get("qk_norm_eps"),
+            **common,
+        )
+    if architecture == "kda":
+        # No KV cache: training/eval always run full sequences, and the KDA
+        # wrapper is stateless anyway. Saves the per-step DynamicCache copies.
+        return LlamaKDAConfig(
+            architectures=["LlamaKDA"],
+            use_cache=False,
+            kda_full_attn_layers=config.get("kda_full_attn_layers"),
+            kda_full_attn_every=config.get("kda_full_attn_every"),
+            kda_full_attn_range=config.get("kda_full_attn_range"),
+            kda_head_dim=config.get("kda_head_dim", 128),
+            kda_num_heads=config.get("kda_num_heads"),
+            kda_num_v_heads=config.get("kda_num_v_heads"),
+            kda_expand_v=config.get("kda_expand_v", 1.0),
+            kda_use_short_conv=config.get("kda_use_short_conv", True),
+            kda_conv_size=config.get("kda_conv_size", 4),
+            kda_conv_bias=config.get("kda_conv_bias", False),
+            kda_allow_neg_eigval=config.get("kda_allow_neg_eigval", False),
+            kda_lower_bound=config.get("kda_lower_bound"),
+            kda_safe_gate=config.get("kda_safe_gate", False),
             qk_norm=config.get("qk_norm", False),
             qk_norm_eps=config.get("qk_norm_eps"),
             **common,
@@ -173,6 +208,14 @@ def _log_model_stats(model, architecture: str):
             f"[LongCat-Ngram] Base: {total-ngram:,} | N-gram: {ngram:,} "
             f"({100 * ngram / total:.2f}%)"
         )
+    if architecture == "kda":
+        layer_types = resolve_kda_layer_types(unwrap_model(model).config)
+        n_kda = layer_types.count("kda")
+        n_full = layer_types.count("full")
+        print0(
+            f"[KDA] {n_kda} KDA + {n_full} full-attn layers | "
+            f"layout={''.join('F' if t == 'full' else 'k' for t in layer_types)}"
+        )
     print0(f"[Model] {architecture}: {total:,} params ({total / 1e9:.2f}B)")
 
 
@@ -190,6 +233,9 @@ def build_model(config: dict, hf_assets_dir: Path, architecture: str):
             attn_implementation=config["attn_implementation"],
             dtype=torch.bfloat16,
         )
+    # HF's generic _init_weights matches fla's canonical KDA init: Linear/Conv1d
+    # get normal(initializer_range); A_log/dt_bias are raw Parameters and keep
+    # fla's own constructor init (verified against fla.models.kda._init_weights).
     model.apply(model._init_weights)
     _log_model_stats(model, architecture)
     return model
@@ -465,7 +511,11 @@ def build_optimizer(model: torch.nn.Module, job, config: dict):
         for name, param in base_model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name.startswith("model.layers.") and param.ndim >= 2:
+            # Muon's Newton-Schulz orthogonalization is defined for 2-D matrices.
+            # ndim==2 (not >=2) keeps baseline/longcat identical (all their hidden
+            # matrices are 2-D) while routing KDA's 3-D short-conv weights to
+            # aux-AdamW instead of feeding Muon a tensor it can't orthogonalize.
+            if name.startswith("model.layers.") and param.ndim == 2:
                 muon_params.append(param)
             elif _is_no_decay(name, param):
                 aux_no_decay.append(param)

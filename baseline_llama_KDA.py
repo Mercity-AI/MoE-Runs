@@ -1,12 +1,24 @@
-"""Train the 1B LLaMA + LongCat input N-gram Embedding ablation."""
+"""Train the 1B LLaMA baseline with Kimi Delta Attention (hybrid KDA + softmax).
+
+Same dense backbone and TorchTitan training loop as ``baseline_llama_torchtitan``,
+but the softmax attention modules are replaced by a config-driven hybrid of Kimi
+Delta Attention (KDA, a gated-delta *linear* attention) and standard softmax
+attention. KDA compute runs through flash-linear-attention's Triton ``chunk_kda``,
+which has a full autograd backward. (Moonshot's FlashKDA CUTLASS kernels are
+forward/inference-only and are never used in training.) No n-gram embeddings —
+this is the plain baseline architecture plus the longcat script's niceties
+(QK-norm on softmax layers, richer logging) and its final-checkpoint save fix.
+"""
 
 import math
 import subprocess
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
+from torch.nn.parallel import DistributedDataParallel
 
 from data import PackedFineWebDataset, build_dataloader
 from utils import (
@@ -14,8 +26,10 @@ from utils import (
     build_torchtitan_ce_loss,
     build_torchtitan_tokenizer,
     ensure_hf_assets,
+    load_tokenizer_size,
     require_torchtitan,
     DualLRScheduler,
+    barrier,
     build_job_config,
     build_optimizer,
     build_scheduler,
@@ -24,10 +38,14 @@ from utils import (
     format_optimizer_log,
     forward_loss,
     get_autocast_context,
+    get_rank,
+    get_world_size,
+    is_main_process,
     load_checkpoint,
     maybe_init_tracker,
     print0,
     progress_bar,
+    reduce_sum_scalar,
     resolve_attention_forward_kwargs,
     run_lm_benchmarks,
     save_checkpoint,
@@ -38,7 +56,7 @@ from utils import (
 
 CONFIG = {
     "hidden_size": 1536,
-    "num_hidden_layers": 25,
+    "num_hidden_layers": 32,
     "num_attention_heads": 12,
     "num_key_value_heads": 6,
     "intermediate_size": 5120,
@@ -50,23 +68,37 @@ CONFIG = {
     "tie_word_embeddings": True,
     "attention_bias": False,
     "hidden_act": "silu",
+    # Softmax (full-attention) layers use this backend; KDA layers ignore it.
     "attn_implementation": "flash_attention_4",
     "tokenizer_name": "meta-llama/Llama-2-7b",
-    "hf_assets_dir": "./hf_assets_llama_1b_longcat_ngram_titan_2307",
-    # LongCat NE: orders 2..3, two hash tables per order, LayerNorm amplification.
-    "ngram_max_n": 3,
-    "ngram_num_heads": 2,
-    "ngram_table_vocab_sizes": [53003, 109009, 165013, 198078],
-    "ngram_embedding_amplification": "layer_norm",
-    # Per-head hash salts: each (order, head) table gets a distinct prime base so
-    # the K sub-tables stay independent hash functions even at equal sizes (guards
-    # against the old K->1 clone collapse). None -> built-in defaults in model.py.
-    # build_model refuses to start if any two heads hash identically, a multiplier
-    # is not coprime to its table size, or two table sizes are within
-    # ngram_min_pairwise_size_gap of each other. See model._validate_ngram_hashing.
-    "ngram_hash_multipliers": None,
-    "ngram_min_pairwise_size_gap": 0.005,
-    # Per-head Q/K RMSNorm after projection and before RoPE (Qwen3/Gemma-style).
+    "hf_assets_dir": "./hf_assets_llama_1b_kda_titan",
+    # --- KDA hybrid layout ---------------------------------------------------
+    # Which decoder layers keep softmax attention; the rest are KDA. Priority:
+    #   kda_full_attn_layers (explicit list) > kda_full_attn_range ([start,end))
+    #   > kda_full_attn_every (interleave: last layer of every block of n).
+    # kda_full_attn_every=4 -> Kimi-Linear / Qwen3-Next style 3:1 (KDA:full):
+    # layers 3,7,11,15,19,23,27,31 are softmax, the other 24 are KDA.
+    "kda_full_attn_layers": None,
+    "kda_full_attn_every": 4,
+    "kda_full_attn_range": None,
+    # --- KDA layer hyperparameters (fla KimiDeltaAttention) ------------------
+    # head_dim 128 matches Kimi-Linear. 10 heads (q/k/v dim 1280) keeps the
+    # model within +5% of the 1.031B baseline; None -> hidden//head_dim (12
+    # heads, +7.4%); 8 heads is param-matched to the GQA layers (-0.2%).
+    "kda_head_dim": 128,
+    "kda_num_heads": 10,
+    "kda_num_v_heads": None,
+    "kda_expand_v": 1.0,
+    "kda_use_short_conv": True,
+    "kda_conv_size": 4,
+    "kda_conv_bias": False,
+    "kda_allow_neg_eigval": False,
+    # lower_bound/safe_gate only matter for FlashKDA *inference* serving (its
+    # kernel requires safe_gate=True). Training uses Triton; leave both unset.
+    "kda_lower_bound": None,
+    "kda_safe_gate": False,
+    # QK-RMSNorm (Qwen3/Gemma-style) on the *softmax* layers only. KDA layers
+    # L2-normalize q/k inside their own kernel, so this does not touch them.
     "qk_norm": True,
     "qk_norm_eps": 1e-6,
     "use_liger_kernel": True,
@@ -99,8 +131,8 @@ CONFIG = {
     "lr_decay_type": "cosine",
     "lr_decay_ratio": None,
     "min_lr_factor": 0.1,
-    "max_steps": 3_053,
-    "target_train_tokens": None,
+    "max_steps": 3_052,
+    "target_train_tokens": 6_000_000_000,
     "per_device_batch_size": 12,
     "grad_accum_steps": 20,
     "max_seq_len": 8192,
@@ -119,12 +151,12 @@ CONFIG = {
     "resume_from_checkpoint": None,
     "init_from_checkpoint": None,
     "allow_inexact_legacy_data_resume": False,
-    "output_dir": "./checkpoints_llama_1b_longcat_ngram_6b_0608",
-    "sync_checkpoints_to_bucket": True,
-    "checkpoint_bucket_folder": "checkpoints_llama_1b_longcat_ngram_6b_0608",
+    "output_dir": "./checkpoints_llama_1b_kda_6b",
+    "sync_checkpoints_to_bucket": False,
+    "checkpoint_bucket_folder": "checkpoints_llama_1b_kda_6b",
     "use_wandb": True,
     "wandb_project": "llama-1b-6b-torchtitan",
-    "wandb_run_name": "llama-6b-1b-ngram-2307",
+    "wandb_run_name": "llama-6b-1b-kda",
     "wandb_log_console": False,
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
@@ -135,13 +167,21 @@ CONFIG = {
 
 def train(config: dict):
     require_torchtitan()
-    device = setup_runtime(distributed=False)
+    device = setup_runtime(distributed=True)
     Path(config["output_dir"]).resolve().mkdir(parents=True, exist_ok=True)
     seed_everything(config["seed"])
-    tracker = maybe_init_tracker(config, config["wandb_run_name"])
+    tracker = maybe_init_tracker(config, config.get("wandb_run_name") or "llama_kda_torchtitan")
 
     try:
-        assets_dir, tokenizer_size = ensure_hf_assets(config, "longcat_ngram")
+        if is_main_process():
+            assets_dir, tokenizer_size = ensure_hf_assets(config, "kda")
+        else:
+            assets_dir = Path(config["hf_assets_dir"]).resolve()
+            tokenizer_size = 0
+        barrier()
+        if not is_main_process():
+            tokenizer_size = load_tokenizer_size(assets_dir)
+
         tokenizer = build_torchtitan_tokenizer(assets_dir)
         resume_path = config.get("resume_from_checkpoint")
         init_path = config.get("init_from_checkpoint")
@@ -150,18 +190,24 @@ def train(config: dict):
         if resume_path or init_path:
             model, start_step, optimizer_state, scheduler_state = load_checkpoint(
                 config,
-                "longcat_ngram",
+                "kda",
                 checkpoint_path=resume_path or init_path,
                 resume_training=bool(resume_path),
             )
         else:
-            model = build_model(config, assets_dir, "longcat_ngram")
+            model = build_model(config, assets_dir, "kda")
             start_step, optimizer_state, scheduler_state = 0, None, None
         model.to(device)
         if tokenizer_size != model.config.vocab_size:
             raise ValueError("Tokenizer and model vocabulary sizes differ.")
         if config["torch_compile"]:
             model = torch.compile(model, mode=config["torch_compile_mode"])
+        if get_world_size() > 1:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[device.index] if device.type == "cuda" else None,
+                output_device=device.index if device.type == "cuda" else None,
+            )
 
         raw_data = load_dataset(
             config["dataset_name"],
@@ -170,28 +216,31 @@ def train(config: dict):
             streaming=True,
         )
         if not config.get("cross_document_attention", True):
-            raise NotImplementedError("Document-masked FA4 attention is not implemented.")
-        print0("[Packing] EOS resets n-grams; causal attention crosses packed documents.")
+            raise NotImplementedError("Document-masked attention is not implemented.")
+        print0("[Packing] KDA carries one causal stream; attention crosses packed documents.")
         train_data = PackedFineWebDataset(
             config,
             tokenizer,
             seed=config["seed"],
             start_batch=start_step * config["grad_accum_steps"],
             partition="train",
+            rank=get_rank(),
+            world_size=get_world_size(),
             base_dataset=raw_data,
         )
         eval_data = PackedFineWebDataset(
             config,
             tokenizer,
             seed=config["seed"] + 9999,
-            max_examples=config["eval_max_examples"],
             partition="eval",
+            rank=get_rank(),
+            world_size=get_world_size(),
             base_dataset=raw_data,
         )
         train_loader = build_dataloader(train_data, config["per_device_batch_size"], config)
         eval_loader = build_dataloader(eval_data, config["per_device_batch_size"], config)
 
-        job = build_job_config(config)
+        job = build_job_config(config, get_world_size())
         max_steps = job.training.steps
         if start_step > max_steps:
             raise ValueError(f"Checkpoint step {start_step} exceeds max_steps={max_steps}.")
@@ -209,6 +258,7 @@ def train(config: dict):
             config["per_device_batch_size"]
             * config["grad_accum_steps"]
             * (config["max_seq_len"] - 1)
+            * get_world_size()
         )
         print0(f"[Train] {max_steps:,} steps | {tokens_per_step * max_steps / 1e9:.3f}B tokens")
         for line in format_optimizer_log(config, job):
@@ -226,13 +276,15 @@ def train(config: dict):
         for step in bar:
             started = time.time()
             loss_sum, token_count = 0.0, 0
-            for _ in range(config["grad_accum_steps"]):
+            for micro_step in range(config["grad_accum_steps"]):
                 try:
                     batch = next(train_iter)
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                with get_autocast_context(device):
+                sync = micro_step == config["grad_accum_steps"] - 1
+                context = nullcontext() if sync or not isinstance(model, DistributedDataParallel) else model.no_sync()
+                with context, get_autocast_context(device):
                     micro_loss, micro_tokens = forward_loss(
                         model, loss_fn, batch["input_ids"], device, use_flce, attention_kwargs
                     )
@@ -244,14 +296,16 @@ def train(config: dict):
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            mean_loss = loss_sum / max(token_count, 1)
+            total_loss = reduce_sum_scalar(loss_sum, device)
+            total_tokens = reduce_sum_scalar(float(token_count), device)
+            mean_loss = total_loss / max(total_tokens, 1.0)
             lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - started
             metrics = {
                 "train/loss": mean_loss,
                 "train/ppl": math.exp(min(mean_loss, 20.0)),
                 "train/lr": lr,
-                "train/tokens_per_sec": token_count / max(elapsed, 1e-6),
+                "train/tokens_per_sec": total_tokens / max(elapsed, 1e-6),
                 "train/tokens_seen": step * tokens_per_step,
                 "train/grad_norm": grad_norm,
                 "step": step,
@@ -269,24 +323,28 @@ def train(config: dict):
                     loss_fn,
                     device,
                     use_flce,
-                    config["eval_max_examples"],
+                    math.ceil(config["eval_max_examples"] / get_world_size()),
                     attention_kwargs,
                 )
                 print0(f"[Eval {step}] loss={eval_metrics['eval_loss']:.4f}")
                 if tracker is not None:
                     tracker.log({f"eval/{k.removeprefix('eval_')}": v for k, v in eval_metrics.items()}, step=step)
                 if config["eval_benchmarks"]:
+                    barrier()
                     benchmarks = run_lm_benchmarks(model, assets_dir, device)
                     if tracker is not None and benchmarks:
                         tracker.log(benchmarks, step=step)
+                    barrier()
             if step % config["save_every_steps"] == 0:
                 save_checkpoint(model, optimizer, scheduler, step, config)
 
         bar.close()
+        # Only save a final checkpoint if the loop didn't already save at max_steps
+        # (guards against the baseline's double write when max_steps % save_every == 0).
         if max_steps % config["save_every_steps"] != 0:
             save_checkpoint(model, optimizer, scheduler, max_steps, config)
-        print0("[Train] LLaMA + LongCat n-gram pretraining complete.")
-        if config.get("sync_checkpoints_to_bucket", False):
+        print0("[Train] Dense LLaMA + KDA pretraining complete.")
+        if config.get("sync_checkpoints_to_bucket", False) and is_main_process():
             sync_script = Path(__file__).resolve().with_name("sync_checkpoint_bucket.sh")
             subprocess.run(
                 [

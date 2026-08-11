@@ -1,12 +1,127 @@
 """Model architectures shared by the baseline and LongCat training scripts."""
 
 import math
+import warnings
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.models.llama import modeling_llama as llama_modeling
+
+try:
+    # Kimi Delta Attention layer (linear attention) from flash-linear-attention.
+    # Optional: only the KDA architecture needs it, so the baseline/longcat scripts
+    # keep importing model.py even when FLA is absent.
+    from fla.layers.kda import KimiDeltaAttention
+
+    FLA_KDA_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - exercised only without FLA
+    KimiDeltaAttention = None
+    FLA_KDA_IMPORT_ERROR = exc
+
+
+# Distinct prime hash multipliers ("salts"), one per (order, head) table. Giving
+# every head a different polynomial base makes the K hash functions genuinely
+# independent *regardless of table size*, so the historical K->1 collapse — two
+# heads that shared a table size hashed every n-gram to the identical slot —
+# cannot recur. Primes larger than the base vocab keep each per-head polynomial
+# injective over the token range, and being coprime to the table sizes avoids the
+# base-multiple collision spike the LongCat paper reports (Fig. 3b): the effective
+# base (multiplier mod table_size) is then a scrambled value rather than the raw
+# vocab size. All of this is enforced at build time by _validate_ngram_hashing.
+_DEFAULT_HASH_MULTIPLIERS = (
+    40009, 100003, 262147, 524287, 1000003, 2000003,
+    3000017, 4000037, 5000011, 6000101, 7000127, 8000009,
+)
+
+# Default minimum pairwise separation between table sizes (fraction of the
+# smaller size). Near-equal sizes are the condition that silently disabled
+# multi-head hashing before, so the build refuses to start below this.
+_DEFAULT_MIN_PAIRWISE_SIZE_GAP = 0.005
+
+
+def _validate_ngram_hashing(
+    table_sizes: list[int],
+    multipliers: list[int],
+    base_vocab: int,
+    min_pairwise_size_gap: float,
+) -> None:
+    """Refuse to build a degenerate n-gram hashing setup. Raises ValueError.
+
+    Guards, in order of how badly they corrupt the experiment:
+
+    1. No two tables may be the *same hash function*. Two heads are identical iff
+       they share both a table size and an effective base (multiplier mod size);
+       that is the exact K->1 collapse. This is the load-bearing invariant.
+    2. Each multiplier must be >= base vocab, or distinct n-grams alias before the
+       modulus (the base-`m` polynomial stops being injective over token digits).
+    3. Each multiplier must be coprime to its table size, or one n-gram coordinate
+       collapses into gcd-many classes (the mechanism behind the paper's spike).
+    4. Table sizes must not be near-duplicates — the config that hid the clone bug.
+
+    A soft warning also fires when a size sits within 5% of base vocab of an
+    integer multiple of it (paper Fig. 3b), which prime multipliers mitigate but
+    do not fully erase.
+    """
+    n = len(table_sizes)
+    if len(multipliers) != n:
+        raise ValueError(
+            f"Expected {n} ngram hash multipliers (one per table), got {len(multipliers)}."
+        )
+
+    # (1) precise clone check: identical (size, effective base) => identical indices.
+    seen: dict[tuple[int, int], int] = {}
+    for idx, (m, s) in enumerate(zip(multipliers, table_sizes)):
+        key = (s, m % s)
+        if key in seen:
+            raise ValueError(
+                f"N-gram hash tables {seen[key]} and {idx} are the SAME hash function "
+                f"(table size {s}, effective base {m % s}). Two heads that hash "
+                "identically collapse K sub-tables to K=1 — exactly the bug this guard "
+                "exists to prevent. Give them distinct multipliers or distinct sizes."
+            )
+        seen[key] = idx
+
+    for m, s in zip(multipliers, table_sizes):
+        # (2) injectivity of the base-`m` polynomial over token digits [0, base_vocab).
+        if m < base_vocab:
+            raise ValueError(
+                f"N-gram hash multiplier {m} must be >= base vocab {base_vocab}; "
+                "a smaller base aliases distinct n-grams before the modulus is applied."
+            )
+        # (3) coprimality: gcd > 1 collapses a coordinate into gcd-many residues.
+        g = math.gcd(m, s)
+        if g != 1:
+            raise ValueError(
+                f"N-gram hash multiplier {m} shares factor {g} with table size {s}. "
+                "Pick a multiplier coprime to the table size (a prime larger than every "
+                "table size is always safe) so no n-gram coordinate collapses."
+            )
+
+    # (4) near-duplicate sizes: the historical trigger for the clone collapse.
+    order = sorted(range(n), key=lambda i: table_sizes[i])
+    for a, b in zip(order, order[1:]):
+        sa, sb = table_sizes[a], table_sizes[b]
+        rel = abs(sa - sb) / min(sa, sb)
+        if rel < min_pairwise_size_gap:
+            raise ValueError(
+                f"N-gram table sizes {sa} and {sb} differ by only {rel * 100:.3f}% "
+                f"(guard requires >= {min_pairwise_size_gap * 100:.3f}%). Near-equal "
+                "sizes are the condition that silently disabled multi-head hashing "
+                "before; spread the table sizes apart."
+            )
+
+    # (5) soft: sizes near an integer multiple of base vocab (paper Fig. 3b).
+    for s in table_sizes:
+        dist = min(s % base_vocab, base_vocab - s % base_vocab)
+        if dist / base_vocab < 0.05:
+            warnings.warn(
+                f"N-gram table size {s} is within {dist} of an integer multiple of base "
+                f"vocab {base_vocab}; the LongCat paper reports collision spikes there. "
+                "The prime multipliers mitigate this, but consider nudging the size.",
+                stacklevel=2,
+            )
 
 
 class LlamaLongCatNgramConfig(LlamaConfig):
@@ -20,6 +135,8 @@ class LlamaLongCatNgramConfig(LlamaConfig):
         ngram_num_heads: int = 2,
         ngram_table_vocab_sizes: Optional[list[int]] = None,
         ngram_embedding_amplification: str = "layer_norm",
+        ngram_hash_multipliers: Optional[list[int]] = None,
+        ngram_min_pairwise_size_gap: float = _DEFAULT_MIN_PAIRWISE_SIZE_GAP,
         qk_norm: bool = False,
         qk_norm_eps: Optional[float] = None,
         **kwargs,
@@ -29,6 +146,8 @@ class LlamaLongCatNgramConfig(LlamaConfig):
         self.ngram_num_heads = ngram_num_heads
         self.ngram_table_vocab_sizes = ngram_table_vocab_sizes
         self.ngram_embedding_amplification = ngram_embedding_amplification
+        self.ngram_hash_multipliers = ngram_hash_multipliers
+        self.ngram_min_pairwise_size_gap = ngram_min_pairwise_size_gap
         self.qk_norm = qk_norm
         self.qk_norm_eps = qk_norm_eps
 
@@ -59,8 +178,30 @@ class LongCatNgramEmbedder(nn.Module):
             )
         self.sub_dim = config.hidden_size // num_tables
 
+        # Resolve the per-head hash multipliers (built-in defaults unless the
+        # config overrides them) and refuse to build a degenerate setup.
+        configured = config.ngram_hash_multipliers
+        if configured is None:
+            if num_tables > len(_DEFAULT_HASH_MULTIPLIERS):
+                raise ValueError(
+                    f"Need {num_tables} hash multipliers but only "
+                    f"{len(_DEFAULT_HASH_MULTIPLIERS)} defaults are defined; pass "
+                    "ngram_hash_multipliers explicitly."
+                )
+            configured = _DEFAULT_HASH_MULTIPLIERS[:num_tables]
+        multipliers: list[int] = [int(m) for m in configured]
+        _validate_ngram_hashing(
+            list(table_vocab_sizes),
+            multipliers,
+            self.base_vocab_size,
+            config.ngram_min_pairwise_size_gap,
+        )
+        # Persist the resolved list so it is serialized in config.json.
+        config.ngram_hash_multipliers = multipliers
+
         self.tables = nn.ModuleDict()
         self.projections = nn.ModuleDict()
+        self.multipliers: dict[str, int] = {}
         idx = 0
         for n in self.orders:
             for k in range(self.num_heads):
@@ -71,6 +212,7 @@ class LongCatNgramEmbedder(nn.Module):
                 self.projections[key] = nn.Linear(
                     self.sub_dim, config.hidden_size, bias=False
                 )
+                self.multipliers[key] = multipliers[idx]
                 idx += 1
 
         amplification = config.ngram_embedding_amplification.strip().lower()
@@ -110,9 +252,16 @@ class LongCatNgramEmbedder(nn.Module):
         input_ids: torch.Tensor,
         n: int,
         table_size: int,
+        multiplier: int,
         shifted_tokens: Optional[dict[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Eq. 2: sum_j t[i-j] * V0**j mod table_size."""
+        """Eq. 2 with a per-head base: sum_j t[i-j] * multiplier**j mod table_size.
+
+        `multiplier` is this head's hash salt (a distinct prime >= base vocab), so
+        two heads never compute the same indices even at equal table sizes. The
+        modulus is applied every Horner step, so the result matches the full
+        polynomial mod `table_size` while staying far inside int64.
+        """
         h = torch.zeros_like(input_ids)
         for j in range(n - 1, -1, -1):
             tok = (
@@ -122,7 +271,7 @@ class LongCatNgramEmbedder(nn.Module):
                 if shifted_tokens is not None
                 else self._shift_right(input_ids, j)
             )
-            h = (h * self.base_vocab_size + tok) % table_size
+            h = (h * multiplier + tok) % table_size
         return h
 
     def forward(
@@ -139,7 +288,7 @@ class LongCatNgramEmbedder(nn.Module):
                 key = f"n{n}_k{k}"
                 table_size = self.tables[key].num_embeddings
                 hash_ids = self._hash_ngram(
-                    input_ids, n, table_size, shifted_tokens
+                    input_ids, n, table_size, self.multipliers[key], shifted_tokens
                 )
                 combined = combined + self.projections[key](
                     self.tables[key](hash_ids)
@@ -232,6 +381,177 @@ LlamaLongCatNgramConfig.register_for_auto_class()
 LlamaLongCatNgram.register_for_auto_class("AutoModelForCausalLM")
 
 
+class LlamaKDAConfig(LlamaConfig):
+    """Config for :class:`LlamaKDA` — a hybrid Kimi-Delta / softmax LLaMA.
+
+    A subset of decoder layers use Kimi Delta Attention (KDA, a gated-delta
+    linear attention); the rest keep standard softmax self-attention (with the
+    same FA backend and optional QK-norm as the baseline). Which layers are which
+    is resolved by :func:`resolve_kda_layer_types`, honoring (in priority order)
+    ``kda_full_attn_layers`` > ``kda_full_attn_range`` > ``kda_full_attn_every``.
+    With none set, every layer is KDA (pure linear attention).
+    """
+
+    model_type = "llama_kda"
+
+    def __init__(
+        self,
+        # --- Hybrid layout: which layers keep softmax (full) attention ---
+        kda_full_attn_layers: Optional[list[int]] = None,
+        kda_full_attn_every: Optional[int] = None,
+        kda_full_attn_range: Optional[list[int]] = None,
+        # --- KDA layer hyperparameters (forwarded to fla KimiDeltaAttention) ---
+        kda_head_dim: int = 128,
+        kda_num_heads: Optional[int] = None,
+        kda_num_v_heads: Optional[int] = None,
+        kda_expand_v: float = 1.0,
+        kda_use_short_conv: bool = True,
+        kda_conv_size: int = 4,
+        kda_conv_bias: bool = False,
+        kda_allow_neg_eigval: bool = False,
+        kda_lower_bound: Optional[float] = None,
+        kda_safe_gate: bool = False,
+        # --- QK-norm applies to the softmax (full-attention) layers only ---
+        qk_norm: bool = False,
+        qk_norm_eps: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.kda_full_attn_layers = kda_full_attn_layers
+        self.kda_full_attn_every = kda_full_attn_every
+        self.kda_full_attn_range = kda_full_attn_range
+        self.kda_head_dim = kda_head_dim
+        self.kda_num_heads = kda_num_heads
+        self.kda_num_v_heads = kda_num_v_heads
+        self.kda_expand_v = kda_expand_v
+        self.kda_use_short_conv = kda_use_short_conv
+        self.kda_conv_size = kda_conv_size
+        self.kda_conv_bias = kda_conv_bias
+        self.kda_allow_neg_eigval = kda_allow_neg_eigval
+        self.kda_lower_bound = kda_lower_bound
+        self.kda_safe_gate = kda_safe_gate
+        self.qk_norm = qk_norm
+        self.qk_norm_eps = qk_norm_eps
+
+
+def resolve_kda_layer_types(config: LlamaKDAConfig) -> list[str]:
+    """Return a per-layer list of ``"kda"`` / ``"full"`` (softmax) attention.
+
+    Priority: explicit ``kda_full_attn_layers`` > contiguous ``kda_full_attn_range``
+    ``[start, end)`` > interleaved ``kda_full_attn_every`` (the last layer of every
+    block of ``n`` is full attention, e.g. ``4`` -> Kimi/Qwen-style 3:1). If none is
+    set, all layers are KDA.
+    """
+    n = config.num_hidden_layers
+    if config.kda_full_attn_layers is not None:
+        full = set(int(i) for i in config.kda_full_attn_layers)
+    elif config.kda_full_attn_range is not None:
+        start, end = config.kda_full_attn_range
+        full = set(range(int(start), int(end)))
+    elif config.kda_full_attn_every:
+        every = int(config.kda_full_attn_every)
+        if every < 1:
+            raise ValueError(f"kda_full_attn_every must be >= 1, got {every}.")
+        full = {i for i in range(n) if (i + 1) % every == 0}
+    else:
+        full = set()
+    for i in full:
+        if not 0 <= i < n:
+            raise ValueError(
+                f"Full-attention layer index {i} is out of range for "
+                f"num_hidden_layers={n}."
+            )
+    return ["full" if i in full else "kda" for i in range(n)]
+
+
+class LlamaKDAAttention(nn.Module):
+    """Adapter wrapping fla's :class:`KimiDeltaAttention` for a LLaMA decoder layer.
+
+    KDA is linear attention: it carries no RoPE and normalizes q/k internally
+    (L2-norm), so ``position_embeddings`` are ignored here. The decoder layer
+    expects a ``(hidden_states, attn_weights)`` pair back; KDA returns a triple, so
+    we drop the cache/weights. A 4-D causal mask (built by ``LlamaModel`` for the
+    softmax layers) is meaningless to KDA — only a 2-D ``[B, T]`` padding mask is
+    forwarded; anything else becomes ``None`` (packed training carries no padding).
+
+    The module is run **stateless**: it never reads or writes ``past_key_values``.
+    HF's ``LlamaModel`` hands every layer an HF ``DynamicCache`` (incompatible with
+    fla's recurrent-state cache), which is fine for full-sequence LM-loss training
+    and eval but means this wrapper does not support HF incremental ``generate``.
+    """
+
+    def __init__(self, config: LlamaKDAConfig, layer_idx: int):
+        super().__init__()
+        if KimiDeltaAttention is None:
+            raise ImportError(
+                "LlamaKDA requires flash-linear-attention (fla) for KimiDeltaAttention."
+            ) from FLA_KDA_IMPORT_ERROR
+        head_dim = config.kda_head_dim
+        num_heads = config.kda_num_heads or (config.hidden_size // head_dim)
+        if num_heads * head_dim != config.hidden_size:
+            # fla supports q/k dim != hidden; Kimi-Linear over-provisions ~1.8x.
+            warnings.warn(
+                f"KDA q/k dim {num_heads * head_dim} != hidden_size "
+                f"{config.hidden_size}; layer params/state will differ from a "
+                "same-width softmax layer.",
+                stacklevel=2,
+            )
+        self.layer_idx = layer_idx
+        self.kda = KimiDeltaAttention(
+            hidden_size=config.hidden_size,
+            expand_v=config.kda_expand_v,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            num_v_heads=config.kda_num_v_heads,
+            mode="chunk",
+            use_short_conv=config.kda_use_short_conv,
+            conv_size=config.kda_conv_size,
+            conv_bias=config.kda_conv_bias,
+            allow_neg_eigval=config.kda_allow_neg_eigval,
+            safe_gate=config.kda_safe_gate,
+            lower_bound=config.kda_lower_bound,
+            layer_idx=layer_idx,
+            norm_eps=config.rms_norm_eps,
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, position_embeddings=None,
+        attention_mask=None, past_key_values=None, use_cache=False, **kwargs,
+    ):
+        mask = attention_mask if (attention_mask is not None and attention_mask.dim() == 2) else None
+        forward_kwargs = {k: v for k, v in kwargs.items() if k == "cu_seqlens"}
+        attn_output, _, _ = self.kda(
+            hidden_states=hidden_states,
+            attention_mask=mask,
+            past_key_values=None,
+            use_cache=False,
+            **forward_kwargs,
+        )
+        return attn_output, None
+
+
+class LlamaKDA(LlamaForCausalLM):
+    """LLaMA whose attention is a config-driven hybrid of KDA and softmax layers."""
+
+    config_class = LlamaKDAConfig
+
+    def __init__(self, config: LlamaKDAConfig):
+        super().__init__(config)
+        layer_types = resolve_kda_layer_types(config)
+        for layer_idx, layer in enumerate(self.model.layers):
+            if layer_types[layer_idx] == "kda":
+                layer.self_attn = LlamaKDAAttention(config, layer_idx)
+            elif config.qk_norm:
+                layer.self_attn = LlamaQKNormAttention(config, layer_idx)
+            # otherwise keep the default softmax LlamaAttention from super().__init__.
+        # Persist the resolved layout so it lands in config.json and can be logged.
+        config.kda_layer_types = layer_types
+
+
+LlamaKDAConfig.register_for_auto_class()
+LlamaKDA.register_for_auto_class("AutoModelForCausalLM")
+
+
 __all__ = [
     "LlamaConfig",
     "LlamaForCausalLM",
@@ -239,4 +559,9 @@ __all__ = [
     "LongCatNgramEmbedder",
     "LlamaQKNormAttention",
     "LlamaLongCatNgram",
+    "LlamaKDAConfig",
+    "LlamaKDAAttention",
+    "LlamaKDA",
+    "resolve_kda_layer_types",
+    "_validate_ngram_hashing",
 ]

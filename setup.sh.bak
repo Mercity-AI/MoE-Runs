@@ -18,8 +18,7 @@ fi
 
 python -m pip install torchtitan==0.2.2 transformers==5.8.0 datasets==4.8.5 \
   wandb liger-kernel==0.8.0 accelerate \
-  trackio tiktoken sentencepiece protobuf tqdm ninja \
-  flash-linear-attention==0.5.2
+  trackio tiktoken sentencepiece protobuf tqdm ninja
 
 python -m pip uninstall -y \
   nvidia-cutlass-dsl \

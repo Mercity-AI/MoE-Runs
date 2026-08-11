@@ -26,3 +26,5 @@ youtube-transcript-api
 # CUDA-matched flash-attn-4 extra as documented in setup.sh.
 flash-attn-4==4.0.0b12
 liger-kernel==0.8.0
+# Kimi Delta Attention layers (Triton chunk_kda) used by baseline_llama_KDA.py
+flash-linear-attention==0.5.2

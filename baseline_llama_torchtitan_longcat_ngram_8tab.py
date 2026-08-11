@@ -1,4 +1,9 @@
-"""Train the 1B LLaMA + LongCat input N-gram Embedding ablation."""
+"""Train the 1B LLaMA + LongCat input N-gram Embedding ablation.
+
+8-table variant: bi/tri-gram only (max_n=3) spread across 4 heads per order
+(8 tables, sub_dim 192) with smaller per-table vocab sizes; dense depth bumped
+to 27 layers to hold the total near ~1.02-1.03B.
+"""
 
 import math
 import subprocess
@@ -38,7 +43,7 @@ from utils import (
 
 CONFIG = {
     "hidden_size": 1536,
-    "num_hidden_layers": 25,
+    "num_hidden_layers": 27,
     "num_attention_heads": 12,
     "num_key_value_heads": 6,
     "intermediate_size": 5120,
@@ -52,11 +57,12 @@ CONFIG = {
     "hidden_act": "silu",
     "attn_implementation": "flash_attention_4",
     "tokenizer_name": "meta-llama/Llama-2-7b",
-    "hf_assets_dir": "./hf_assets_llama_1b_longcat_ngram_titan_2307",
-    # LongCat NE: orders 2..3, two hash tables per order, LayerNorm amplification.
+    "hf_assets_dir": "./hf_assets_llama_1b_longcat_ngram_8tab_titan_2307",
+    # LongCat NE: orders 2..3, four hash tables per order, LayerNorm amplification.
+    # More-tables/smaller-sizes variant: 8 tables (2 orders x 4 heads), sub_dim 192.
     "ngram_max_n": 3,
-    "ngram_num_heads": 2,
-    "ngram_table_vocab_sizes": [53003, 109009, 165013, 198078],
+    "ngram_num_heads": 4,
+    "ngram_table_vocab_sizes": [41011, 53003, 70001, 88003, 101009, 117013, 134017, 151027],
     "ngram_embedding_amplification": "layer_norm",
     # Per-head hash salts: each (order, head) table gets a distinct prime base so
     # the K sub-tables stay independent hash functions even at equal sizes (guards
@@ -119,12 +125,12 @@ CONFIG = {
     "resume_from_checkpoint": None,
     "init_from_checkpoint": None,
     "allow_inexact_legacy_data_resume": False,
-    "output_dir": "./checkpoints_llama_1b_longcat_ngram_6b_0608",
+    "output_dir": "./checkpoints_llama_1b_longcat_ngram_8tab_6b_0608",
     "sync_checkpoints_to_bucket": True,
-    "checkpoint_bucket_folder": "checkpoints_llama_1b_longcat_ngram_6b_0608",
+    "checkpoint_bucket_folder": "checkpoints_llama_1b_longcat_ngram_8tab_6b_0608",
     "use_wandb": True,
     "wandb_project": "llama-1b-6b-torchtitan",
-    "wandb_run_name": "llama-6b-1b-ngram-2307",
+    "wandb_run_name": "llama-6b-1b-ngram-8tab-2307",
     "wandb_log_console": False,
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,

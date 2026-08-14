@@ -24,6 +24,8 @@ from model import (
     LlamaKDAConfig,
     LlamaLongCatNgram,
     LlamaLongCatNgramConfig,
+    LlamaQKNorm,
+    LlamaQKNormConfig,
     resolve_kda_layer_types,
 )
 
@@ -88,7 +90,7 @@ def _architecture_types(architecture: str):
     if architecture == "kda":
         return LlamaKDAConfig, LlamaKDA
     if architecture == "llama":
-        return LlamaConfig, LlamaForCausalLM
+        return LlamaQKNormConfig, LlamaQKNorm
     raise ValueError(f"Unknown architecture: {architecture!r}")
 
 
@@ -135,6 +137,8 @@ def build_model_config(config: dict, tokenizer, architecture: str):
             kda_full_attn_layers=config.get("kda_full_attn_layers"),
             kda_full_attn_every=config.get("kda_full_attn_every"),
             kda_full_attn_range=config.get("kda_full_attn_range"),
+            kda_every=config.get("kda_every"),
+            kda_offset=config.get("kda_offset", 0),
             kda_head_dim=config.get("kda_head_dim", 128),
             kda_num_heads=config.get("kda_num_heads"),
             kda_num_v_heads=config.get("kda_num_v_heads"),
@@ -150,7 +154,12 @@ def build_model_config(config: dict, tokenizer, architecture: str):
             **common,
         )
     if architecture == "llama":
-        return LlamaConfig(architectures=["LlamaForCausalLM"], **common)
+        return LlamaQKNormConfig(
+            architectures=["LlamaQKNorm"],
+            qk_norm=config.get("qk_norm", False),
+            qk_norm_eps=config.get("qk_norm_eps"),
+            **common,
+        )
     raise ValueError(f"Unknown architecture: {architecture!r}")
 
 
@@ -241,6 +250,23 @@ def build_model(config: dict, hf_assets_dir: Path, architecture: str):
     return model
 
 
+def _load_safetensors_state_dict(checkpoint: Path) -> dict:
+    """Gather a checkpoint's weights from safetensors (single-file or sharded)."""
+    from safetensors.torch import load_file
+
+    index = checkpoint / "model.safetensors.index.json"
+    if index.exists():
+        weight_map = json.loads(index.read_text())["weight_map"]
+        state_dict = {}
+        for shard in sorted(set(weight_map.values())):
+            state_dict.update(load_file(str(checkpoint / shard)))
+        return state_dict
+    single = checkpoint / "model.safetensors"
+    if single.exists():
+        return load_file(str(single))
+    raise FileNotFoundError(f"No safetensors weights found in {checkpoint}")
+
+
 def load_pretrained_model(config: dict, checkpoint: Path, architecture: str):
     maybe_enable_liger_kernel(config)
     config_class, model_class = _architecture_types(architecture)
@@ -248,12 +274,30 @@ def load_pretrained_model(config: dict, checkpoint: Path, architecture: str):
     model_config.max_position_embeddings = max(
         model_config.max_position_embeddings, config["max_seq_len"]
     )
+    # Build with _from_config (exactly like build_model) and load the weights
+    # ourselves, rather than calling model_class.from_pretrained(). For the KDA
+    # hybrid, from_pretrained() returns a model that emits NaNs on the very first
+    # forward (its construction path leaves fla's KimiDeltaAttention layers in a
+    # bad state; low_cpu_mem_usage=False does NOT help). Constructing via
+    # _from_config + load_state_dict reproduces the pre-save eval loss exactly,
+    # so the resume/init path now matches how the model was originally built.
     with _patch_initialize_weights_compat():
-        model = model_class.from_pretrained(
-            checkpoint,
-            config=model_config,
+        model = model_class._from_config(
+            model_config,
             attn_implementation=config["attn_implementation"],
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+        )
+    state_dict = _load_safetensors_state_dict(Path(checkpoint))
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    model.tie_weights()
+    # A tied LM head is the only weight legitimately absent from the checkpoint
+    # (tie_word_embeddings shares embed_tokens.weight); anything else is a real load
+    # failure and must not be silently left at random init.
+    real_missing = [key for key in missing if key != "lm_head.weight"]
+    if real_missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint load mismatch for {checkpoint}: "
+            f"missing={real_missing} unexpected={list(unexpected)}"
         )
     _log_model_stats(model, architecture)
     return model
@@ -442,6 +486,14 @@ def build_job_config(config: dict, world_size: int = 1):
     job.training.steps = resolve_training_steps(config, world_size)
     job.training.max_norm = config["grad_clip"]
     return job
+
+
+def grad_norm_for(params) -> float:
+    """L2 grad norm over a param list, diagnostic only (no clipping/scaling)."""
+    grads = [p.grad.detach() for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    return torch.norm(torch.stack([g.float().norm() for g in grads])).item()
 
 
 class NativeMuonWithAuxAdam:

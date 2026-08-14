@@ -29,9 +29,11 @@ from utils import (
     get_autocast_context,
     get_rank,
     get_world_size,
+    grad_norm_for,
     is_main_process,
     load_checkpoint,
     maybe_init_tracker,
+    NativeMuonWithAuxAdam,
     print0,
     progress_bar,
     reduce_sum_scalar,
@@ -58,6 +60,10 @@ CONFIG = {
     "attention_bias": False,
     "hidden_act": "silu",
     "attn_implementation": "flash_attention_4",
+    # Per-head Q/K RMSNorm after projection and before RoPE (Qwen3/Gemma-style),
+    # applied to every dense softmax layer. Matches the KDA/LongCat scripts.
+    "qk_norm": True,
+    "qk_norm_eps": 1e-6,
     "tokenizer_name": "meta-llama/Llama-2-7b",
     "hf_assets_dir": "./hf_assets_llama_1b_titan",
     "use_liger_kernel": True,
@@ -90,28 +96,36 @@ CONFIG = {
     "lr_decay_type": "cosine",
     "lr_decay_ratio": None,
     "min_lr_factor": 0.1,
-    "max_steps": 3_052,
-    "target_train_tokens": 6_000_000_000,
-    "per_device_batch_size": 12,
-    "grad_accum_steps": 20,
+    # Fixed-step mode (target_train_tokens=None), matching the KDA/ngram scripts so
+    # all three train the same 3053 optimizer steps. NOTE: setting target_train_tokens
+    # would OVERRIDE max_steps (resolve_training_steps) and, on multi-GPU, shrink the
+    # step count by world_size instead of scaling tokens -- keep it None.
+    # 10 * 24 * 8191 * 3053 = 6.002B tokens at world_size=1.
+    "max_steps": 3_053,
+    "target_train_tokens": None,
+    "per_device_batch_size": 10,
+    "grad_accum_steps": 24,
     "max_seq_len": 8192,
     "dataset_name": "HuggingFaceFW/fineweb",
     "dataset_config": "sample-10BT",
     "streaming_buffer_size": 10_000,
+    "eval_streaming_buffer_size": 1,
     "eval_max_examples": 512,
     "eval_holdout_fraction": 0.005,
     "cross_document_attention": True,
-    "eval_every_steps": 500,
+    "eval_every_steps": 250,
     "eval_benchmarks": False,
-    "save_every_steps": 500,
+    "save_every_steps": 250,
     "log_every_steps": 1,
     "seed": 42,
     "resume_from_checkpoint": None,
     "init_from_checkpoint": None,
     "allow_inexact_legacy_data_resume": False,
-    "output_dir": "./checkpoints_llama_1b_6b",
+    "output_dir": "./checkpoints_llama_baseline_1b_6b_rerun",
     "use_wandb": True,
     "wandb_project": "llama-1b-6b-torchtitan",
+    "wandb_run_name": "llama-1b-baseline-rerun-qknorm-6b",
+    "wandb_log_console": False,
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
     "torch_compile": False,
@@ -124,7 +138,7 @@ def train(config: dict):
     device = setup_runtime(distributed=True)
     Path(config["output_dir"]).resolve().mkdir(parents=True, exist_ok=True)
     seed_everything(config["seed"])
-    tracker = maybe_init_tracker(config, "llama_baseline_torchtitan")
+    tracker = maybe_init_tracker(config, config.get("wandb_run_name") or "llama_baseline_torchtitan")
 
     try:
         if is_main_process():
@@ -228,7 +242,8 @@ def train(config: dict):
         )
         for step in bar:
             started = time.time()
-            loss_sum, token_count = 0.0, 0
+            loss_accum = torch.zeros((), device=device, dtype=torch.float32)
+            token_count = 0
             for micro_step in range(config["grad_accum_steps"]):
                 try:
                     batch = next(train_iter)
@@ -242,13 +257,22 @@ def train(config: dict):
                         model, loss_fn, batch["input_ids"], device, use_flce, attention_kwargs
                     )
                     (micro_loss / config["grad_accum_steps"]).backward()
-                loss_sum += micro_loss.detach().item() * micro_tokens
+                # Accumulate (loss * tokens) on-device. Calling .item() here would
+                # force a CUDA sync every micro-step (grad_accum_steps-1 extra syncs
+                # per optimizer step), stalling CPU run-ahead and the kernel-launch
+                # pipeline. We sync once, after the loop, instead.
+                loss_accum += micro_loss.detach().float() * micro_tokens
                 token_count += micro_tokens
 
+            muon_grad_norm = adam_grad_norm = None
+            if isinstance(optimizer, NativeMuonWithAuxAdam):
+                muon_grad_norm = grad_norm_for(p for g in optimizer.muon.param_groups for p in g["params"])
+                adam_grad_norm = grad_norm_for(p for g in optimizer.adam.param_groups for p in g["params"])
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"]).item()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            loss_sum = loss_accum.item()  # single per-step device sync for logging
             total_loss = reduce_sum_scalar(loss_sum, device)
             total_tokens = reduce_sum_scalar(float(token_count), device)
             mean_loss = total_loss / max(total_tokens, 1.0)
@@ -263,6 +287,9 @@ def train(config: dict):
                 "train/grad_norm": grad_norm,
                 "step": step,
             }
+            if muon_grad_norm is not None:
+                metrics["train/grad_norm_muon"] = muon_grad_norm
+                metrics["train/grad_norm_adam"] = adam_grad_norm
             if isinstance(scheduler, DualLRScheduler):
                 metrics["train/aux_lr"] = scheduler.adam.get_last_lr()[0]
             bar.set_postfix(loss=f"{mean_loss:.4f}", lr=f"{lr:.2e}")
@@ -292,7 +319,10 @@ def train(config: dict):
                 save_checkpoint(model, optimizer, scheduler, step, config)
 
         bar.close()
-        save_checkpoint(model, optimizer, scheduler, max_steps, config)
+        # Only save a final checkpoint if the loop didn't already save at max_steps
+        # (guards against a double write when max_steps % save_every == 0).
+        if max_steps % config["save_every_steps"] != 0:
+            save_checkpoint(model, optimizer, scheduler, max_steps, config)
         print0("[Train] Dense LLaMA pretraining complete.")
     finally:
         if tracker is not None:

@@ -400,6 +400,11 @@ class LlamaKDAConfig(LlamaConfig):
         kda_full_attn_layers: Optional[list[int]] = None,
         kda_full_attn_every: Optional[int] = None,
         kda_full_attn_range: Optional[list[int]] = None,
+        # Sparse-KDA interleave (the inverse of kda_full_attn_every): one KDA layer
+        # every `kda_every` layers, at indices where i % kda_every == kda_offset;
+        # every other layer is full (GQA) attention.
+        kda_every: Optional[int] = None,
+        kda_offset: int = 0,
         # --- KDA layer hyperparameters (forwarded to fla KimiDeltaAttention) ---
         kda_head_dim: int = 128,
         kda_num_heads: Optional[int] = None,
@@ -420,6 +425,8 @@ class LlamaKDAConfig(LlamaConfig):
         self.kda_full_attn_layers = kda_full_attn_layers
         self.kda_full_attn_every = kda_full_attn_every
         self.kda_full_attn_range = kda_full_attn_range
+        self.kda_every = kda_every
+        self.kda_offset = kda_offset
         self.kda_head_dim = kda_head_dim
         self.kda_num_heads = kda_num_heads
         self.kda_num_v_heads = kda_num_v_heads
@@ -439,8 +446,9 @@ def resolve_kda_layer_types(config: LlamaKDAConfig) -> list[str]:
 
     Priority: explicit ``kda_full_attn_layers`` > contiguous ``kda_full_attn_range``
     ``[start, end)`` > interleaved ``kda_full_attn_every`` (the last layer of every
-    block of ``n`` is full attention, e.g. ``4`` -> Kimi/Qwen-style 3:1). If none is
-    set, all layers are KDA.
+    block of ``n`` is full attention, e.g. ``4`` -> Kimi/Qwen-style 3:1) > ``kda_every``
+    (the INVERSE — KDA is the sparse type: one KDA layer every ``kda_every`` layers at
+    ``i % kda_every == kda_offset``, all others full). If none is set, all layers are KDA.
     """
     n = config.num_hidden_layers
     if config.kda_full_attn_layers is not None:
@@ -453,6 +461,15 @@ def resolve_kda_layer_types(config: LlamaKDAConfig) -> list[str]:
         if every < 1:
             raise ValueError(f"kda_full_attn_every must be >= 1, got {every}.")
         full = {i for i in range(n) if (i + 1) % every == 0}
+    elif getattr(config, "kda_every", None):
+        # Inverse of kda_full_attn_every: KDA is the SPARSE type. One KDA layer every
+        # `kda_every` layers at i % kda_every == kda_offset; every other layer is full.
+        every = int(config.kda_every)
+        if every < 1:
+            raise ValueError(f"kda_every must be >= 1, got {every}.")
+        offset = int(getattr(config, "kda_offset", 0) or 0) % every
+        kda = {i for i in range(n) if i % every == offset}
+        full = set(range(n)) - kda
     else:
         full = set()
     for i in full:
@@ -462,6 +479,16 @@ def resolve_kda_layer_types(config: LlamaKDAConfig) -> list[str]:
                 f"num_hidden_layers={n}."
             )
     return ["full" if i in full else "kda" for i in range(n)]
+
+
+# fla ships two KDA kernels: ``chunk_kda`` (chunked-parallel, the ONLY one with a
+# real Triton autograd backward) and ``fused_recurrent_kda`` (step-wise, for
+# short/decode inference). Training must always run ``chunk``. fla self-guards
+# (`assert mode == "chunk"` when a module is in training mode, and it only
+# auto-switches to fused_recurrent for q_len <= 64 in eval), but we pin and assert
+# the training kernel at our own boundary so a config/library drift can never
+# silently train on the inference kernel.
+KDA_TRAINING_MODE = "chunk"
 
 
 class LlamaKDAAttention(nn.Module):
@@ -503,7 +530,7 @@ class LlamaKDAAttention(nn.Module):
             head_dim=head_dim,
             num_heads=num_heads,
             num_v_heads=config.kda_num_v_heads,
-            mode="chunk",
+            mode=KDA_TRAINING_MODE,
             use_short_conv=config.kda_use_short_conv,
             conv_size=config.kda_conv_size,
             conv_bias=config.kda_conv_bias,
@@ -513,13 +540,34 @@ class LlamaKDAAttention(nn.Module):
             layer_idx=layer_idx,
             norm_eps=config.rms_norm_eps,
         )
+        # Construction guard: fail loud if fla ever stops honouring the requested
+        # kernel (so training can't silently fall onto a non-backward path).
+        built_mode = getattr(self.kda, "mode", None)
+        if built_mode != KDA_TRAINING_MODE:
+            raise ValueError(
+                f"KDA layer {layer_idx} built with mode={built_mode!r}, but training "
+                f"requires the {KDA_TRAINING_MODE!r} kernel (only chunk_kda has a backward)."
+            )
 
     def forward(
         self, hidden_states: torch.Tensor, position_embeddings=None,
         attention_mask=None, past_key_values=None, use_cache=False, **kwargs,
     ):
+        # Runtime guard: any forward that will build a graph (module in training
+        # mode) MUST use the chunk kernel. fla routes to fused_recurrent only when
+        # ``q_len <= 64 and not self.training``; asserting training-mode==chunk here
+        # closes that path at our boundary and catches a layer left in eval mode
+        # during a training step (which, with a short q_len, would lose gradients).
+        if self.training and getattr(self.kda, "mode", None) != KDA_TRAINING_MODE:
+            raise RuntimeError(
+                f"KDA layer {self.layer_idx} is in training mode but its kernel is "
+                f"{getattr(self.kda, 'mode', None)!r}, not {KDA_TRAINING_MODE!r}; refusing "
+                "to train on the inference (fused_recurrent) path."
+            )
         mask = attention_mask if (attention_mask is not None and attention_mask.dim() == 2) else None
         forward_kwargs = {k: v for k, v in kwargs.items() if k == "cu_seqlens"}
+        # Always stateless: never read/write a recurrent cache (past_key_values=None,
+        # use_cache=False), so the recurrent-state branch is unreachable regardless.
         attn_output, _, _ = self.kda(
             hidden_states=hidden_states,
             attention_mask=mask,
@@ -548,8 +596,76 @@ class LlamaKDA(LlamaForCausalLM):
         config.kda_layer_types = layer_types
 
 
+def assert_kda_training_kernels(model) -> int:
+    """Fail fast if any KDA layer would train on the wrong kernel or in eval mode.
+
+    Call this right after ``model.train()`` (and any DDP/compile wrap) but before
+    the training loop, so a misconfiguration is caught before burning compute
+    rather than mid-step. Returns the number of KDA layers verified. Non-KDA
+    (softmax) layers are ignored, so it is safe to call on any LlamaKDA model.
+    """
+    base = getattr(model, "module", model)          # unwrap DDP
+    base = getattr(base, "_orig_mod", base)          # unwrap torch.compile
+    checked = 0
+    for idx, layer in enumerate(base.model.layers):
+        kda = getattr(layer.self_attn, "kda", None)
+        if kda is None:
+            continue
+        checked += 1
+        mode = getattr(kda, "mode", None)
+        if mode != KDA_TRAINING_MODE:
+            raise RuntimeError(
+                f"KDA layer {idx} kernel is {mode!r}, not {KDA_TRAINING_MODE!r}; "
+                "refusing to start training on a non-backward kernel."
+            )
+        if not kda.training:
+            raise RuntimeError(
+                f"KDA layer {idx} is in eval mode at training start; call model.train() "
+                "first (eval + short q_len would route to the inference kernel)."
+            )
+    return checked
+
+
 LlamaKDAConfig.register_for_auto_class()
 LlamaKDA.register_for_auto_class("AutoModelForCausalLM")
+
+
+class LlamaQKNormConfig(LlamaConfig):
+    """Plain dense LLaMA config with optional QK-RMSNorm (Qwen3/Gemma-style).
+
+    Same backbone as ``LlamaConfig``; adds ``qk_norm`` so the baseline can carry
+    the per-head Q/K RMSNorm that the KDA and LongCat models already use. With
+    ``qk_norm=False`` this is behaviourally identical to a vanilla LLaMA.
+    """
+
+    model_type = "llama_qknorm"
+
+    def __init__(
+        self,
+        qk_norm: bool = False,
+        qk_norm_eps: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.qk_norm = qk_norm
+        self.qk_norm_eps = qk_norm_eps
+
+
+class LlamaQKNorm(LlamaForCausalLM):
+    """Dense LLaMA whose softmax attention gets per-head Q/K RMSNorm when enabled."""
+
+    config_class = LlamaQKNormConfig
+
+    def __init__(self, config: LlamaQKNormConfig):
+        super().__init__(config)
+        if getattr(config, "qk_norm", False):
+            for layer_idx, layer in enumerate(self.model.layers):
+                layer.self_attn = LlamaQKNormAttention(config, layer_idx)
+        # otherwise keep the default softmax LlamaAttention from super().__init__.
+
+
+LlamaQKNormConfig.register_for_auto_class()
+LlamaQKNorm.register_for_auto_class("AutoModelForCausalLM")
 
 
 __all__ = [
@@ -558,10 +674,14 @@ __all__ = [
     "LlamaLongCatNgramConfig",
     "LongCatNgramEmbedder",
     "LlamaQKNormAttention",
+    "LlamaQKNormConfig",
+    "LlamaQKNorm",
     "LlamaLongCatNgram",
     "LlamaKDAConfig",
     "LlamaKDAAttention",
     "LlamaKDA",
+    "assert_kda_training_kernels",
+    "KDA_TRAINING_MODE",
     "resolve_kda_layer_types",
     "_validate_ngram_hashing",
 ]

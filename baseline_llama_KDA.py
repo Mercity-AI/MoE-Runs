@@ -21,6 +21,7 @@ from datasets import load_dataset
 from torch.nn.parallel import DistributedDataParallel
 
 from data import PackedFineWebDataset, build_dataloader
+from model import assert_kda_training_kernels, KDA_TRAINING_MODE
 from utils import (
     build_model,
     build_torchtitan_ce_loss,
@@ -40,9 +41,11 @@ from utils import (
     get_autocast_context,
     get_rank,
     get_world_size,
+    grad_norm_for,
     is_main_process,
     load_checkpoint,
     maybe_init_tracker,
+    NativeMuonWithAuxAdam,
     print0,
     progress_bar,
     reduce_sum_scalar,
@@ -71,22 +74,31 @@ CONFIG = {
     # Softmax (full-attention) layers use this backend; KDA layers ignore it.
     "attn_implementation": "flash_attention_4",
     "tokenizer_name": "meta-llama/Llama-2-7b",
-    "hf_assets_dir": "./hf_assets_llama_1b_kda_titan",
+    "hf_assets_dir": "./hf_assets_llama_1b_kda_3to1_h12",
     # --- KDA hybrid layout ---------------------------------------------------
-    # Which decoder layers keep softmax attention; the rest are KDA. Priority:
-    #   kda_full_attn_layers (explicit list) > kda_full_attn_range ([start,end))
-    #   > kda_full_attn_every (interleave: last layer of every block of n).
-    # kda_full_attn_every=4 -> Kimi-Linear / Qwen3-Next style 3:1 (KDA:full):
-    # layers 3,7,11,15,19,23,27,31 are softmax, the other 24 are KDA.
+    # KDA is the SPARSE attention type here: 8 KDA + 24 GQA over 32 layers, placed
+    # by RULE instead of a hand-listed set. `kda_every` = one KDA layer every N
+    # layers, at i % kda_every == kda_offset; every other layer is GQA (full).
+    #   kda_every=4, kda_offset=0  ->  KDA at 0,4,8,...,28  ->  layout kFFF kFFF ...
+    # (one KDA at the start of each block of 4, followed by three GQA).
+    # Priority in resolve_kda_layer_types (first set wins):
+    #   kda_full_attn_layers > kda_full_attn_range > kda_full_attn_every > kda_every.
+    # To instead put the KDA layer AT THE END of each block ("3 GQA then 1 KDA",
+    # KDA at 3,7,...,31), set kda_offset=3 -- note that is a different placement than
+    # the one benchmarked/verified this session.
     "kda_full_attn_layers": None,
-    "kda_full_attn_every": 4,
     "kda_full_attn_range": None,
+    "kda_full_attn_every": None,
+    "kda_every": 4,
+    "kda_offset": 0,
     # --- KDA layer hyperparameters (fla KimiDeltaAttention) ------------------
-    # head_dim 128 matches Kimi-Linear. 10 heads (q/k/v dim 1280) keeps the
-    # model within +5% of the 1.031B baseline; None -> hidden//head_dim (12
-    # heads, +7.4%); 8 heads is param-matched to the GQA layers (-0.2%).
+    # head_dim 128 matches Kimi-Linear. 12 heads makes q/k/v dim == hidden_size
+    # (1536), same width as the residual stream, +7.4% vs the 1.031B baseline --
+    # outside the report's 5% fairness window, so a win here isn't isolated from
+    # the extra capacity. 8 heads (1024) was the param-matched control (-0.2%);
+    # 10 heads (1280, +3.6%) is the flagship's over-provisioned default.
     "kda_head_dim": 128,
-    "kda_num_heads": 10,
+    "kda_num_heads": 12,
     "kda_num_v_heads": None,
     "kda_expand_v": 1.0,
     "kda_use_short_conv": True,
@@ -131,10 +143,10 @@ CONFIG = {
     "lr_decay_type": "cosine",
     "lr_decay_ratio": None,
     "min_lr_factor": 0.1,
-    "max_steps": 3_052,
-    "target_train_tokens": 6_000_000_000,
-    "per_device_batch_size": 12,
-    "grad_accum_steps": 20,
+    "target_train_tokens": None,
+    "max_steps": 3053,
+    "per_device_batch_size": 10,
+    "grad_accum_steps": 24,
     "max_seq_len": 8192,
     "dataset_name": "HuggingFaceFW/fineweb",
     "dataset_config": "sample-10BT",
@@ -143,26 +155,42 @@ CONFIG = {
     "eval_max_examples": 512,
     "eval_holdout_fraction": 0.005,
     "cross_document_attention": True,
-    "eval_every_steps": 500,
+    "eval_every_steps": 250,
     "eval_benchmarks": False,
-    "save_every_steps": 500,
+    "save_every_steps": 250,
     "log_every_steps": 1,
     "seed": 42,
     "resume_from_checkpoint": None,
     "init_from_checkpoint": None,
     "allow_inexact_legacy_data_resume": False,
-    "output_dir": "./checkpoints_llama_1b_kda_6b",
+    "output_dir": "./checkpoints_llama_1b_kda_3to1_h12_6b",
     "sync_checkpoints_to_bucket": False,
-    "checkpoint_bucket_folder": "checkpoints_llama_1b_kda_6b",
+    "checkpoint_bucket_folder": "checkpoints_llama_1b_kda_3to1_h12_6b_1308",
     "use_wandb": True,
     "wandb_project": "llama-1b-6b-torchtitan",
-    "wandb_run_name": "llama-6b-1b-kda",
+    "wandb_run_name": "llama-1b-kda-3to1-h12-1308",
     "wandb_log_console": False,
     "dataloader_workers": 8,
     "dataloader_prefetch_factor": 2,
     "torch_compile": False,
     "torch_compile_mode": "default",
 }
+
+
+def _kda_gate_decay_stats(kda_module, gate_input: torch.Tensor) -> tuple[float, float, float]:
+    """Per-step forget-gate retained fraction exp(g), g = -exp(A_log)*softplus(f_proj(x)+dt_bias)
+    (fla's own KimiDeltaAttention formula). Unbounded below (safe_gate=False here, so
+    kda_lower_bound is inert) -- mean near 0 means a layer is forgetting almost everything
+    every step, mean near 1 means it has stopped forgetting at all; either is the signature
+    of a saturated gate, not just a large train/grad_norm.
+    """
+    with torch.no_grad():
+        num_v_heads, head_k_dim = kda_module.num_v_heads, kda_module.head_k_dim
+        g = gate_input.float().view(*gate_input.shape[:-1], num_v_heads, head_k_dim)
+        dt_bias = kda_module.dt_bias.float().view(num_v_heads, head_k_dim)
+        a_log = kda_module.A_log.float().view(num_v_heads, 1)
+        decay = (-torch.exp(a_log) * torch.nn.functional.softplus(g + dt_bias)).exp()
+    return decay.mean().item(), decay.min().item(), decay.max().item()
 
 
 def train(config: dict):
@@ -172,6 +200,7 @@ def train(config: dict):
     seed_everything(config["seed"])
     tracker = maybe_init_tracker(config, config.get("wandb_run_name") or "llama_kda_torchtitan")
 
+    layer_execution = None
     try:
         if is_main_process():
             assets_dir, tokenizer_size = ensure_hf_assets(config, "kda")
@@ -198,6 +227,37 @@ def train(config: dict):
             model = build_model(config, assets_dir, "kda")
             start_step, optimizer_state, scheduler_state = 0, None, None
         model.to(device)
+        if config.get("verify_layer_execution", False):
+            layer_execution = {
+                idx: {"type": kind, "forward": 0, "backward": 0}
+                for idx, kind in enumerate(getattr(model.config, "kda_layer_types", []))
+            }
+            for layer_idx, layer in enumerate(model.model.layers):
+                def count_forward(_module, _inputs, _output, idx=layer_idx):
+                    layer_execution[idx]["forward"] += 1
+
+                layer.self_attn.register_forward_hook(count_forward)
+                probe = next(param for param in layer.self_attn.parameters() if param.requires_grad)
+
+                def count_backward(grad, idx=layer_idx):
+                    layer_execution[idx]["backward"] += 1
+                    return grad
+
+                probe.register_hook(count_backward)
+
+        kda_gate_probe: dict[int, torch.Tensor] = {}
+        kda_gate_modules: dict[int, torch.nn.Module] = {}
+        for layer_idx, kind in enumerate(getattr(model.config, "kda_layer_types", [])):
+            if kind != "kda":
+                continue
+            kda_module = model.model.layers[layer_idx].self_attn.kda
+            kda_gate_modules[layer_idx] = kda_module
+
+            def _capture_gate_input(_module, _inputs, output, idx=layer_idx):
+                kda_gate_probe[idx] = output.detach()
+
+            kda_module.f_proj.register_forward_hook(_capture_gate_input)
+
         if tokenizer_size != model.config.vocab_size:
             raise ValueError("Tokenizer and model vocabulary sizes differ.")
         if config["torch_compile"]:
@@ -266,6 +326,8 @@ def train(config: dict):
 
         train_iter = iter(train_loader)
         model.train()
+        n_kda = assert_kda_training_kernels(model)
+        print0(f"[KDA] Verified {n_kda} KDA layers on the '{KDA_TRAINING_MODE}' training kernel.")
         optimizer.zero_grad(set_to_none=True)
         bar = progress_bar(
             range(start_step + 1, max_steps + 1),
@@ -275,7 +337,8 @@ def train(config: dict):
         )
         for step in bar:
             started = time.time()
-            loss_sum, token_count = 0.0, 0
+            loss_accum = torch.zeros((), device=device, dtype=torch.float32)
+            token_count = 0
             for micro_step in range(config["grad_accum_steps"]):
                 try:
                     batch = next(train_iter)
@@ -289,13 +352,22 @@ def train(config: dict):
                         model, loss_fn, batch["input_ids"], device, use_flce, attention_kwargs
                     )
                     (micro_loss / config["grad_accum_steps"]).backward()
-                loss_sum += micro_loss.detach().item() * micro_tokens
+                # Accumulate the (loss * tokens) product on-device. Calling .item()
+                # here would force a CUDA sync every micro-step (grad_accum_steps-1
+                # extra syncs per optimizer step), stalling CPU run-ahead and the
+                # kernel-launch pipeline. We sync once, after the loop, instead.
+                loss_accum += micro_loss.detach().float() * micro_tokens
                 token_count += micro_tokens
 
+            muon_grad_norm = adam_grad_norm = None
+            if isinstance(optimizer, NativeMuonWithAuxAdam):
+                muon_grad_norm = grad_norm_for(p for g in optimizer.muon.param_groups for p in g["params"])
+                adam_grad_norm = grad_norm_for(p for g in optimizer.adam.param_groups for p in g["params"])
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"]).item()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            loss_sum = loss_accum.item()  # single per-step device sync for logging
             total_loss = reduce_sum_scalar(loss_sum, device)
             total_tokens = reduce_sum_scalar(float(token_count), device)
             mean_loss = total_loss / max(total_tokens, 1.0)
@@ -310,6 +382,9 @@ def train(config: dict):
                 "train/grad_norm": grad_norm,
                 "step": step,
             }
+            if muon_grad_norm is not None:
+                metrics["train/grad_norm_muon"] = muon_grad_norm
+                metrics["train/grad_norm_adam"] = adam_grad_norm
             if isinstance(scheduler, DualLRScheduler):
                 metrics["train/aux_lr"] = scheduler.adam.get_last_lr()[0]
             bar.set_postfix(loss=f"{mean_loss:.4f}", lr=f"{lr:.2e}")
@@ -329,6 +404,29 @@ def train(config: dict):
                 print0(f"[Eval {step}] loss={eval_metrics['eval_loss']:.4f}")
                 if tracker is not None:
                     tracker.log({f"eval/{k.removeprefix('eval_')}": v for k, v in eval_metrics.items()}, step=step)
+                if kda_gate_modules:
+                    gate_metrics, means, mins, maxs = {}, [], [], []
+                    for layer_idx, kda_module in kda_gate_modules.items():
+                        probe = kda_gate_probe.get(layer_idx)
+                        if probe is None:
+                            continue
+                        mean_d, min_d, max_d = _kda_gate_decay_stats(kda_module, probe)
+                        gate_metrics[f"kda/layer{layer_idx}_gate_decay_mean"] = mean_d
+                        gate_metrics[f"kda/layer{layer_idx}_gate_decay_min"] = min_d
+                        gate_metrics[f"kda/layer{layer_idx}_gate_decay_max"] = max_d
+                        means.append(mean_d)
+                        mins.append(min_d)
+                        maxs.append(max_d)
+                    if means:
+                        gate_metrics["kda/gate_decay_mean"] = sum(means) / len(means)
+                        gate_metrics["kda/gate_decay_min"] = min(mins)
+                        gate_metrics["kda/gate_decay_max"] = max(maxs)
+                        print0(
+                            f"[Eval {step}] kda gate decay mean={gate_metrics['kda/gate_decay_mean']:.4f} "
+                            f"min={gate_metrics['kda/gate_decay_min']:.4f} max={gate_metrics['kda/gate_decay_max']:.4f}"
+                        )
+                    if tracker is not None:
+                        tracker.log(gate_metrics, step=step)
                 if config["eval_benchmarks"]:
                     barrier()
                     benchmarks = run_lm_benchmarks(model, assets_dir, device)
@@ -343,6 +441,18 @@ def train(config: dict):
         # (guards against the baseline's double write when max_steps % save_every == 0).
         if max_steps % config["save_every_steps"] != 0:
             save_checkpoint(model, optimizer, scheduler, max_steps, config)
+        if layer_execution is not None:
+            failures = []
+            expected_backwards = max_steps * config["grad_accum_steps"]
+            for layer_idx, counts in layer_execution.items():
+                print0(
+                    f"[Execution] layer={layer_idx} type={counts['type']} "
+                    f"forward={counts['forward']} backward={counts['backward']}"
+                )
+                if counts["forward"] < expected_backwards or counts["backward"] != expected_backwards:
+                    failures.append((layer_idx, counts))
+            if failures:
+                raise RuntimeError(f"Attention layer execution verification failed: {failures}")
         print0("[Train] Dense LLaMA + KDA pretraining complete.")
         if config.get("sync_checkpoints_to_bucket", False) and is_main_process():
             sync_script = Path(__file__).resolve().with_name("sync_checkpoint_bucket.sh")

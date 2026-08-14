@@ -126,7 +126,7 @@ CONFIG = {
     "wandb_project": "llama-1b-6b-torchtitan",
     "wandb_run_name": "llama-6b-1b-ngram-2307",
     "wandb_log_console": False,
-    "dataloader_workers": 8,
+    "dataloader_workers": 16,
     "dataloader_prefetch_factor": 2,
     "torch_compile": False,
     "torch_compile_mode": "default",

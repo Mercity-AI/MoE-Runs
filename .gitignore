@@ -1,0 +1,10 @@
+monitoring/
+monitoring/.env
+monitoring/.runpod-monitor-state.json
+monitoring/.telegram-monitor-state.json
+monitoring/monitor.stdout.log
+monitoring/monitor.stderr.log
+monitoring/telegram-monitor.stdout.log
+monitoring/telegram-monitor.stderr.log
+__pycache__/
+*.py[cod]

@@ -1,0 +1,40 @@
+# Smoke Test — Quick validation that the pipeline works
+checkpoint: /workspace/MOE_Work_1609/checkpoints/baseline/step_003053_hf
+method: lora
+attn_implementation: sdpa
+
+# Dataset
+dataset: few-nerd
+max_seq_len: 256
+train_limit: 100
+eval_limit: 50
+
+# Training
+epochs: 1
+max_steps: 20
+batch_size: 4
+grad_accum: 1
+lr: 0.0002
+warmup_ratio: 0.03
+grad_checkpointing: false
+seed: 42
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# Logging & Checkpointing
+output_dir: /workspace/MOE_Work_1609/ner_runs/smoke_test
+logging_steps: 5
+eval_steps: 10
+save_steps: 10
+
+# WandB
+wandb_project: ner-sft
+wandb_run_name: smoke-test
+
+# Generation Eval
+max_new_tokens: 64
+generation_eval_limit: 20
+eval_batch_size: 8

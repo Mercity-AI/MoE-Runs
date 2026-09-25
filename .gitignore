@@ -8,3 +8,6 @@ monitoring/telegram-monitor.stdout.log
 monitoring/telegram-monitor.stderr.log
 __pycache__/
 *.py[cod]
+
+# blog drafts and figures (kept local)
+blog/

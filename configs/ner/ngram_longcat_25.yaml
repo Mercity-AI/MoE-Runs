@@ -1,0 +1,42 @@
+# LongCat N-gram (25%) — LoRA NER Fine-Tuning (JSON format)
+checkpoint: /workspace/moe/checkpoints/longcat_ngram_25/step_003053_hf
+method: lora
+attn_implementation: sdpa
+output_format: json
+
+# Dataset
+dataset: few-nerd
+max_seq_len: 1024
+train_limit: null
+eval_limit: null
+
+# Training
+epochs: 2
+max_steps: -1
+batch_size: 30
+grad_accum: 4
+lr: 0.00003
+warmup_ratio: 0.10
+optim: adamw_torch_fused
+grad_checkpointing: true
+seed: 42
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# Logging & Checkpointing
+output_dir: /workspace/moe/ner_runs/ngram_longcat_25_json
+logging_steps: 1
+eval_steps: 250
+save_steps: 250
+
+# WandB
+wandb_project: ner-sft
+wandb_run_name: ngram-longcat-25-json-v1
+
+# Generation Eval
+max_new_tokens: 1024
+generation_eval_limit: 1024
+eval_batch_size: 16

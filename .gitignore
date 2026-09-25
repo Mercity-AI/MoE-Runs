@@ -11,3 +11,6 @@ __pycache__/
 
 # blog drafts and figures (kept local)
 blog/
+
+# old scripts and notes kept locally, not tracked
+unused/

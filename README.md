@@ -18,7 +18,6 @@ scripts/
     analysis/    NER analysis scripts
 configs/
   ner/           one NER fine-tuning config per run
-docs/            design notes: FA4 setup, n-gram sizing, KDA config, packing, ablation plan
 ```
 
 | Path | What it is |

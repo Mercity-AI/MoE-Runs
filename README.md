@@ -12,6 +12,8 @@ The same repo holds the downstream NER fine-tuning (LoRA on Few-NERD) and its ev
 ```
 scripts/
   pretraining/   training scripts, model definitions, shared data and training helpers
+  eval/          zero-shot benchmark evaluation (lm-eval)
+  ablations/     grafting, layer pruning, 4-bit quantization, KDA interpretability
   ner/           NER fine-tuning, evaluation, vLLM port
     analysis/    NER analysis scripts
 configs/
@@ -34,7 +36,12 @@ docs/            design notes: FA4 setup, n-gram sizing, KDA config, packing, ab
 | `scripts/ner/vllm_env.py`, `vllm_ngram_model.py` | vLLM environment patch and vLLM port of the custom architectures |
 | `scripts/ner/analysis/` | Parity check, significance tests, failure modes, win/loss, validation loss |
 | `configs/ner/` | NER fine-tuning configs |
-| `eval.py` | Zero-shot benchmark evaluation |
+| `scripts/eval/eval.py` | Zero-shot nine-task benchmark (Shared-9) through `lm-eval` |
+| `scripts/ablations/graft_kda_gqa.py` | Transplant attention between the KDA and baseline checkpoints |
+| `scripts/ablations/graft_ngram_into_baseline.py` | Attach a trained n-gram input module to the baseline |
+| `scripts/ablations/prune_decoder_layers.py`, `prune_kda_layers.py` | Remove whole decoder blocks and save a new checkpoint |
+| `scripts/ablations/quantize_eval.py` | Quantize a checkpoint (bf16 / int8 / nf4) and run the benchmark |
+| `scripts/ablations/kda_interpretability.py` | KDA gate/decay statistics on FineWeb text |
 | `setup.sh`, `requirements.txt` | Environment setup |
 
 ## Setup
@@ -110,11 +117,65 @@ The runs in this project used a single B200 (180 GB), streaming FineWeb `sample-
 
 ## Benchmark evaluation
 
+`scripts/eval/eval.py` runs the nine zero-shot tasks behind the Shared-9 average (HellaSwag, WinoGrande, ARC-Easy, ARC-Challenge, PIQA, OpenBookQA, CommonsenseQA, SciQ, LAMBADA) through `lm-eval`, on each task's full split:
+
 ```bash
-python eval.py --checkpoint checkpoints/kda/step_003053_hf
+python scripts/eval/eval.py --checkpoint checkpoints/kda/step_003053_hf --output results/kda_eval.json
 ```
 
-`eval.py` in this repo scores HellaSwag and WinoGrande by log-likelihood. The full nine-task suite used in the reports (via `lm-eval`) lives in the newer `eval.py` in the bucket's `2209-moe-runs/scripts/`.
+- `--limit N` evaluates only N examples per task, for a quick smoke test.
+- `--batch-size` defaults to `auto`; `--attn-implementation` is `eager` or `sdpa`.
+- A full run takes about an hour per checkpoint. Several can run in parallel on one GPU if memory allows.
+
+## Ablations
+
+These scripts build modified checkpoints from the trained ones, with no retraining, then score them with the same benchmark.
+
+**Grafting** transplants modules between independently trained checkpoints:
+
+```bash
+# baseline GQA attention into the KDA model, at the KDA layer positions
+python scripts/ablations/graft_kda_gqa.py --direction gqa-into-kda --layers 0,4,8,12,16,20,24,28 \
+  --baseline checkpoints/baseline/step_003053_hf --kda checkpoints/kda/step_003053_hf \
+  --output checkpoints/grafts/gqa_into_kda
+
+# KDA attention into the baseline (the result is saved as a LlamaKDA checkpoint)
+python scripts/ablations/graft_kda_gqa.py --direction kda-into-gqa --layers 0,4,8,12,16,20,24,28 \
+  --baseline checkpoints/baseline/step_003053_hf --kda checkpoints/kda/step_003053_hf \
+  --output checkpoints/grafts/kda_into_gqa
+
+# trained n-gram input module onto the baseline
+python scripts/ablations/graft_ngram_into_baseline.py --baseline checkpoints/baseline/step_003053_hf \
+  --ngram checkpoints/longcat_ngram_25/step_003053_hf --output checkpoints/grafts/ngram25_into_baseline
+```
+
+`python scripts/ablations/test_graft_kda_gqa.py` runs the unit tests for the layer-list parsing and checks.
+
+**Pruning** removes whole decoder blocks (attention, MLP and norms together) and saves a new checkpoint. It needs no GPU and takes a couple of minutes:
+
+```bash
+python scripts/ablations/prune_decoder_layers.py --checkpoint checkpoints/kda/step_003053_hf --layers 0 \
+  --output checkpoints/prunes/kda_prune_l00
+python scripts/eval/eval.py --checkpoint checkpoints/prunes/kda_prune_l00 --output results/kda_prune_l00_eval.json
+```
+
+`prune_kda_layers.py` removes every KDA-containing block from a KDA checkpoint at once. For the matched dense control, run `prune_decoder_layers.py` on the baseline with `--layers 0,4,8,12,16,20,24,28`.
+
+**Quantization** loads a checkpoint in bf16, int8, or 4-bit NF4 (needs `bitsandbytes`) and runs the benchmark. The n-gram tables are not ordinary weight matrices and stay in higher precision:
+
+```bash
+python scripts/ablations/quantize_eval.py --checkpoint checkpoints/baseline/step_003053_hf --method nf4 \
+  --output results/baseline_nf4_eval.json
+```
+
+Each run takes 12 to 15 minutes. The first KDA run on a new machine spends about 90 seconds compiling its kernels.
+
+**KDA interpretability** streams FineWeb documents through a KDA checkpoint and reports per-layer gate and decay statistics:
+
+```bash
+python scripts/ablations/kda_interpretability.py --checkpoint checkpoints/kda/step_003053_hf --num-docs 32 \
+  --output results/kda_gate_decay_report.json
+```
 
 ## NER fine-tuning
 
